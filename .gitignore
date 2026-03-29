@@ -1,0 +1,29 @@
+AGENTS_initial.md
+agents_initial.md
+ONBOARDING.md
+.DS_Store
+LOCAL/
+
+# Local runtime artifacts
+LOGS/*
+!LOGS/.gitkeep
+MEMORY/*
+!MEMORY/.gitkeep
+SESSIONS/*
+!SESSIONS/.gitkeep
+!SESSIONS/ONE-OFF/
+SESSIONS/ONE-OFF/*
+!SESSIONS/ONE-OFF/.gitkeep
+PROJECTS/*
+!PROJECTS/.gitkeep
+
+# Local example jobs and personal scheduling payloads
+com.arjuna.growth-driver*.plist
+daily-growth-directive.sh
+distill-daily-memory.sh
+launch-daily-growth-directive.command
+daily-growth-directive.cron
+templates
+legacy
+
+tools/__pycache__
