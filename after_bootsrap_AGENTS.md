@@ -31,7 +31,7 @@ If something should persist across sessions, put it in a file.
 
 ## Projects
 
-Use [PROJECTS](PROJECTS) for durable project-specific context.
+Use [PROJECT_DOCUMENTS](PROJECT_DOCUMENTS) for durable project-specific context.
 
 If you find useful context that should survive beyond the current chat such as images, PDFs, docx documents, text files, etc.:
 
@@ -51,6 +51,12 @@ When solving repeated problems:
 - prefer improving the workspace over re-solving the same thing later
 - document stable workflows
 - make future sessions cheaper and sharper
+
+When a user asks to schedule future work:
+
+- use `declaw schedule codex ...` for future Codex runs
+- use `declaw schedule reminder ...` for simple reminders
+- prefer `--project <name>` when the schedule targets a tracked declaw workspace
 
 ## Safety
 

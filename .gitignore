@@ -16,6 +16,10 @@ SESSIONS/ONE-OFF/*
 !SESSIONS/ONE-OFF/.gitkeep
 PROJECTS/*
 !PROJECTS/.gitkeep
+PROJECT_DOCUMENTS/*
+!PROJECT_DOCUMENTS/.gitkeep
+bin/
+/declaw
 
 # Local example jobs and personal scheduling payloads
 com.arjuna.growth-driver*.plist

@@ -1,29 +1,44 @@
-# declawtter
+# declaw
 
-General-purpose assistant workspace for openClaw-style workspace, memory, session continuity, and reusable operating context.
+`declaw` is a reusable assistant workspace template plus a native Go CLI for:
 
-## What This Repo Is For
+- creating tracked copies of the workspace without Git metadata
+- listing and removing tracked copies
+- printing project paths for shell `cd` flows
+- scheduling Codex runs and simple reminders through macOS `launchd`
 
-- give a nice personality for agents based on the openClaw workspace
-- storing durable workspace identity and user context in file system
-- keeping reusable workspace guidance in `WORKSPACE/`
-- preserving assistant operating rules in `AGENTS.md`
-- supporting session continuity without baking runtime state into source code
+## Commands
+
+```sh
+declaw
+declaw create my-workspace
+declaw list
+declaw path my-workspace
+cd "$(declaw path my-workspace)"
+
+declaw schedule codex morning-review --project my-workspace --daily 09:30 --prompt "Review the repo and summarize blockers."
+declaw schedule reminder drink-water --daily 14:00 --title "Reminder" --body "Drink water."
+declaw schedule list
+```
+
+Running `declaw` without arguments opens an interactive command launcher:
+
+- command input at the top
+- matching commands listed below
+- blue default selection
+- up and down arrows to move
+- Enter to select or run
 
 ## Workspace Structure
 
-- [AGENTS.md](/Users/alejandrocamus/Documents/dev/declawtter/AGENTS.md): workspace bootstrap and handoff contract
+- [draft_AGENTS_doNotUse.md](/Users/alejandrocamus/Documents/dev/declawtter/draft_AGENTS_doNotUse.md): bootstrap contract template for generated workspaces
 - [WORKSPACE](/Users/alejandrocamus/Documents/dev/declawtter/WORKSPACE): identity, user, soul, tools, and skills context
 - [MEMORY](/Users/alejandrocamus/Documents/dev/declawtter/MEMORY): distilled day-level memory summaries
-- [templates](/Users/alejandrocamus/Documents/dev/declawtter/templates): starter docs for bootstrapping or copying the workspace pattern
-- [legacy](/Users/alejandrocamus/Documents/dev/declawtter/legacy): historical notes kept only for reference
+- [SESSIONS](/Users/alejandrocamus/Documents/dev/declawtter/SESSIONS): raw session history
+- [PROJECT_DOCUMENTS](/Users/alejandrocamus/Documents/dev/declawtter/PROJECT_DOCUMENTS): durable project artifacts
 
-## Operating Model
+## Notes
 
-The repo is intentionally lightweight.
-
-The assistant should use files for continuity instead of hidden state:
-
-- write durable facts to `WORKSPACE/`
-- write day summaries to `MEMORY/`
-- keep reusable workflows documented instead of re-discovering them
+- Scheduled Codex runs store the effective prompt with workspace bootstrap instructions.
+- Recurring Codex schedules install an optional paired recovery job by default.
+- This implementation is currently macOS-focused because scheduling uses `launchd`.
