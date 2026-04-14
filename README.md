@@ -21,6 +21,22 @@ declaw schedule reminder drink-water --daily 14:00 --title "Reminder" --body "Dr
 declaw schedule list
 ```
 
+For agent-created recurring Codex jobs, always choose or register the project first:
+
+```sh
+declaw list
+declaw create pm-workspace --into ~/Documents/dev
+declaw track product-repo --path ~/Documents/dev/my-codebase
+declaw schedule codex pm-deadline-review --project pm-workspace --weekdays 09:00 --prompt "Use the configured PM CLI to update this workspace, inspect the relevant codebase directory named in the workspace docs, and propose deadline/reminder follow-ups."
+declaw schedule codex repo-risk-review --project product-repo --daily 10:00 --prompt "Inspect this codebase and summarize product-management risks, deadline pressure, and reminder candidates."
+```
+
+For one-off Codex jobs, `--project` or `--workspace` is optional. If omitted, declaw uses `~/.local/share/declaw/workspaces/one-off` as a scratch workspace:
+
+```sh
+declaw schedule codex quick-note --at "2026-04-14 15:30" --prompt "Open an interactive Codex session for this one-off task."
+```
+
 Running `declaw` without arguments opens an interactive command launcher:
 
 - command input at the top
@@ -40,5 +56,7 @@ Running `declaw` without arguments opens an interactive command launcher:
 ## Notes
 
 - Scheduled Codex runs store the effective prompt with workspace bootstrap instructions.
+- Recurring Codex runs require an explicit declaw project and run Codex with that project directory as context.
+- One-off Codex runs may omit a directory and use declaw's default one-off workspace.
 - Recurring Codex schedules install an optional paired recovery job by default.
 - This implementation is currently macOS-focused because scheduling uses `launchd`.

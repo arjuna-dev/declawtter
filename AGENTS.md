@@ -53,7 +53,9 @@ When the user wants to schedule future work:
 
 - use `declaw schedule codex ...` for scheduled Codex tasks
 - use `declaw schedule reminder ...` for simple reminders
-- prefer `--project <name>` when the target workspace is a tracked declaw project
+- always pass `--project <name>` for recurring Codex schedules
+- if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
+- for one-off Codex schedules only, `--workspace <path>` or no target is allowed
 - only avoid scheduling when the user clearly does not want a scheduled action
 
 ## Handoff After Bootstrap

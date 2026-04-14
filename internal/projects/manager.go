@@ -19,6 +19,7 @@ type Project struct {
 	Name      string    `json:"name"`
 	Path      string    `json:"path"`
 	Source    string    `json:"source"`
+	Linked    bool      `json:"linked,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -127,6 +128,64 @@ func (m *Manager) Create(args []string) (string, error) {
 	return fmt.Sprintf("created %s\n%s", name, target), nil
 }
 
+func (m *Manager) Track(args []string) (string, error) {
+	fs := flag.NewFlagSet("track", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	path := fs.String("path", "", "existing project directory")
+	if err := fs.Parse(cliargs.ReorderForFlagSet(args, map[string]bool{
+		"path": true,
+	})); err != nil {
+		return "", err
+	}
+
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return "", errors.New("usage: declaw track <name> --path <dir>")
+	}
+	if strings.TrimSpace(*path) == "" {
+		return "", errors.New("--path is required")
+	}
+
+	name := sanitizeName(rest[0])
+	if name == "" {
+		return "", errors.New("project name must contain at least one alphanumeric character")
+	}
+
+	absPath, err := filepath.Abs(*path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return "", fmt.Errorf("project path is not accessible: %s", absPath)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project path is not a directory: %s", absPath)
+	}
+
+	registry, err := m.loadRegistry()
+	if err != nil {
+		return "", err
+	}
+	if _, exists := registry.Projects[name]; exists {
+		return "", fmt.Errorf("project %q already exists in registry", name)
+	}
+
+	project := Project{
+		Name:      name,
+		Path:      absPath,
+		Linked:    true,
+		CreatedAt: time.Now().UTC(),
+	}
+	registry.Projects[name] = project
+	if err := m.saveRegistry(registry); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("tracked %s\n%s", name, absPath), nil
+}
+
 func (m *Manager) List(args []string) (string, error) {
 	if len(args) != 0 {
 		return "", errors.New("usage: declaw list")
@@ -180,12 +239,17 @@ func (m *Manager) Remove(args []string) (string, error) {
 		return "", fmt.Errorf("unknown project %q", name)
 	}
 
-	if err := os.RemoveAll(project.Path); err != nil {
-		return "", err
+	if !project.Linked {
+		if err := os.RemoveAll(project.Path); err != nil {
+			return "", err
+		}
 	}
 	delete(registry.Projects, name)
 	if err := m.saveRegistry(registry); err != nil {
 		return "", err
+	}
+	if project.Linked {
+		return fmt.Sprintf("untracked %s", name), nil
 	}
 	return fmt.Sprintf("removed %s", name), nil
 }

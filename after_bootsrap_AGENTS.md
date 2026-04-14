@@ -56,7 +56,9 @@ When a user asks to schedule future work:
 
 - use `declaw schedule codex ...` for future Codex runs
 - use `declaw schedule reminder ...` for simple reminders
-- prefer `--project <name>` when the schedule targets a tracked declaw workspace
+- always pass `--project <name>` for recurring Codex schedules
+- if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
+- for one-off Codex schedules only, `--workspace <path>` or no target is allowed
 
 ## Safety
 

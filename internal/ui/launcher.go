@@ -17,6 +17,7 @@ type Command struct {
 func Commands() []Command {
 	return []Command{
 		{Name: "create", Description: "Create a tracked copy of the workspace template"},
+		{Name: "track", Description: "Track an existing directory as a declaw project"},
 		{Name: "list", Description: "List tracked projects"},
 		{Name: "path", Description: "Print a tracked project path"},
 		{Name: "remove", Description: "Remove a tracked project"},

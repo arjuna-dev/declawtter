@@ -131,6 +131,8 @@ func (a *App) execute(args []string) (string, error) {
 		return a.help(), nil
 	case "create":
 		return a.projects.Create(args[1:])
+	case "track":
+		return a.projects.Track(args[1:])
 	case "list":
 		return a.projects.List(args[1:])
 	case "path":
@@ -150,6 +152,7 @@ declaw
 
 Commands:
   create <name> [--into <dir>] [--source <dir>]
+  track <name> --path <dir>
   list
   path <name>
   remove <name>
@@ -164,19 +167,33 @@ Commands:
   schedule prune-once
   schedule get-prompt <job>
   schedule get-time <job>
-  schedule codex <job> --prompt <text> (--project <name> | --workspace <path> | --no-workspace) [schedule flags]
+  schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
+  schedule codex <job> --prompt <text> [--project <name> | --workspace <path>] --at "YYYY-MM-DD HH:MM"
   schedule reminder <job> --title <text> --body <text> [schedule flags]
-  schedule edit <job> [schedule flags] [--prompt <text>] [--project <name> | --workspace <path> | --no-workspace] [--title <text>] [--body <text>]
+  schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--title <text>] [--body <text>]
 
 Schedule flags:
   --daily HH:MM
   --weekdays HH:MM
   --weekly mon@09:30
-  --at "YYYY-MM-DD HH:MM"
+  --at "YYYY-MM-DD HH:MM"        One-off schedule at an exact future time.
   --time HH:MM
-  --once
+  --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
   --no-recurring-fallback
+
+Agent workflow:
+  1. For a recurring Codex job, first choose a declaw project.
+  2. If the target directory already exists, run declaw track <name> --path <dir>, then use --project <name>.
+  3. If a fresh assistant workspace is needed, run declaw create <name> --into <parent-dir>, then use --project <name>.
+  4. For one-off Codex jobs only, --project/--workspace may be omitted; declaw uses ~/.local/share/declaw/workspaces/one-off.
+  5. Do not create recurring Codex schedules without --project; the CLI rejects that because recurring jobs need managed project context.
+
+Examples:
+  declaw create pm-workspace --into ~/Documents/dev
+  declaw track product-repo --path ~/Documents/dev/my-repo
+  declaw schedule codex pm-deadline-review --project pm-workspace --weekdays 09:00 --prompt "Review the workspace, update the relevant CLI-managed directory, inspect the codebase context, and propose PM deadline/reminder follow-ups."
+  declaw schedule codex repo-review --project product-repo --daily 10:00 --prompt "Review this repo for PM risks, deadlines, and reminders."
 `)
 }

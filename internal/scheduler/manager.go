@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"declaw/internal/cliargs"
@@ -38,6 +37,7 @@ type Manager struct {
 	projects        *projects.Manager
 	supportDir      string
 	runsDir         string
+	jobsDir         string
 	jobsPath        string
 	launchAgentsDir string
 	domain          string
@@ -65,7 +65,7 @@ func NewManager(projectsManager *projects.Manager) (*Manager, error) {
 
 	supportDir := filepath.Join(home, ".local", "share", "declaw")
 	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
-	for _, path := range []string{supportDir, filepath.Join(supportDir, "runs"), launchAgentsDir} {
+	for _, path := range []string{supportDir, filepath.Join(supportDir, "runs"), filepath.Join(supportDir, "logs"), filepath.Join(supportDir, "jobs"), launchAgentsDir} {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return nil, err
 		}
@@ -75,6 +75,7 @@ func NewManager(projectsManager *projects.Manager) (*Manager, error) {
 		projects:        projectsManager,
 		supportDir:      supportDir,
 		runsDir:         filepath.Join(supportDir, "runs"),
+		jobsDir:         filepath.Join(supportDir, "jobs"),
 		jobsPath:        filepath.Join(supportDir, "jobs.json"),
 		launchAgentsDir: launchAgentsDir,
 		domain:          fmt.Sprintf("gui/%s", currentUser.Uid),
@@ -84,7 +85,10 @@ func NewManager(projectsManager *projects.Manager) (*Manager, error) {
 
 func (m *Manager) Execute(args []string) (string, error) {
 	if len(args) == 0 {
-		return "", errors.New("usage: declaw schedule <subcommand>")
+		return m.help(), nil
+	}
+	if isHelpArg(args[0]) {
+		return m.help(), nil
 	}
 
 	switch args[0] {
@@ -282,6 +286,7 @@ func (m *Manager) remove(args []string) (string, error) {
 	}
 
 	if name != "" {
+		m.removePromptFile(name)
 		delete(store.Jobs, sanitizeName(name))
 		if err := m.saveJobs(store); err != nil {
 			return "", err
@@ -313,6 +318,7 @@ func (m *Manager) removeAll(args []string) (string, error) {
 			}
 			lines = append(lines, fmt.Sprintf("removed %s", label))
 		}
+		m.removePromptFile(name)
 		delete(store.Jobs, name)
 	}
 	if err := m.saveJobs(store); err != nil {
@@ -377,13 +383,17 @@ func (m *Manager) getTime(args []string) (string, error) {
 }
 
 func (m *Manager) scheduleCodex(args []string) (string, error) {
+	if hasHelpArg(args) {
+		return m.codexHelp(), nil
+	}
+
 	fs := flag.NewFlagSet("codex", flag.ContinueOnError)
 	fs.SetOutput(bytes.NewBuffer(nil))
 
 	prompt := fs.String("prompt", "", "prompt")
 	projectName := fs.String("project", "", "tracked project")
 	workspace := fs.String("workspace", "", "workspace path")
-	noWorkspace := fs.Bool("no-workspace", false, "disable workspace bootstrap")
+	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
 	daily := fs.String("daily", "", "daily time")
 	timeValue := fs.String("time", "", "daily time")
 	weekdays := fs.String("weekdays", "", "weekday time")
@@ -409,15 +419,10 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 
 	rest := fs.Args()
 	if len(rest) != 1 {
-		return "", errors.New("usage: declaw schedule codex <job> --prompt <text> (--project <name> | --workspace <path> | --no-workspace) [schedule flags]")
+		return "", errors.New("usage: declaw schedule codex <job> --prompt <text> --project <name> [recurring flags] OR declaw schedule codex <job> --prompt <text> [--project <name> | --workspace <path>] --at \"YYYY-MM-DD HH:MM\"")
 	}
 	if strings.TrimSpace(*prompt) == "" {
 		return "", errors.New("--prompt is required")
-	}
-
-	resolvedWorkspace, workspaceBootstrap, err := m.resolveWorkspace(*projectName, *workspace, *noWorkspace)
-	if err != nil {
-		return "", err
 	}
 
 	config, err := resolveScheduleConfig(scheduleShapeInput{
@@ -438,6 +443,11 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 		return "", err
 	}
 
+	resolvedWorkspace, workspaceBootstrap, err := m.resolveWorkspace(*projectName, *workspace, *noWorkspace, config.Kind)
+	if err != nil {
+		return "", err
+	}
+
 	jobName := sanitizeName(rest[0])
 	effectivePrompt := buildCodexPrompt(*prompt, config.Kind == "recurring", workspaceBootstrap)
 	record := JobRecord{
@@ -450,7 +460,7 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 		Cwd:                *cwd,
 		Stdout:             *stdout,
 		Stderr:             *stderr,
-		Env:                upsertEnv([]string(env), promptEnvKey, effectivePrompt),
+		Env:                []string(env),
 		HasRecovery:        config.Kind == "recurring" && !*noRecurringFallback,
 		PrimaryLabel:       primaryLabel(jobName),
 		RecoveryLabel:      recoveryLabel(jobName),
@@ -464,6 +474,10 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 }
 
 func (m *Manager) scheduleReminder(args []string) (string, error) {
+	if hasHelpArg(args) {
+		return m.reminderHelp(), nil
+	}
+
 	fs := flag.NewFlagSet("reminder", flag.ContinueOnError)
 	fs.SetOutput(bytes.NewBuffer(nil))
 
@@ -542,13 +556,17 @@ func (m *Manager) scheduleReminder(args []string) (string, error) {
 }
 
 func (m *Manager) edit(args []string) (string, error) {
+	if hasHelpArg(args) {
+		return m.editHelp(), nil
+	}
+
 	fs := flag.NewFlagSet("edit", flag.ContinueOnError)
 	fs.SetOutput(bytes.NewBuffer(nil))
 
 	prompt := fs.String("prompt", "", "prompt")
 	projectName := fs.String("project", "", "project")
 	workspace := fs.String("workspace", "", "workspace")
-	noWorkspace := fs.Bool("no-workspace", false, "disable workspace")
+	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
 	title := fs.String("title", "", "title")
 	body := fs.String("body", "", "body")
 	daily := fs.String("daily", "", "daily")
@@ -625,7 +643,7 @@ func (m *Manager) edit(args []string) (string, error) {
 		workspaceBootstrap := record.WorkspaceBootstrap
 		if *projectName != "" || *workspace != "" || *noWorkspace {
 			var err error
-			resolvedWorkspace, workspaceBootstrap, err = m.resolveWorkspace(*projectName, *workspace, *noWorkspace)
+			resolvedWorkspace, workspaceBootstrap, err = m.resolveWorkspace(*projectName, *workspace, *noWorkspace, record.Config.Kind)
 			if err != nil {
 				return "", err
 			}
@@ -638,7 +656,6 @@ func (m *Manager) edit(args []string) (string, error) {
 				taskPrompt = *prompt
 			}
 			record.Prompt = buildCodexPrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap)
-			record.Env = upsertEnv(record.Env, promptEnvKey, record.Prompt)
 		}
 	case "reminder":
 		if *title != "" {
@@ -666,12 +683,9 @@ func (m *Manager) edit(args []string) (string, error) {
 	return fmt.Sprintf("updated %s", record.Name), nil
 }
 
-func (m *Manager) resolveWorkspace(projectName, workspace string, noWorkspace bool) (string, bool, error) {
-	if noWorkspace && (strings.TrimSpace(projectName) != "" || strings.TrimSpace(workspace) != "") {
-		return "", false, errors.New("--no-workspace cannot be combined with --project or --workspace")
-	}
+func (m *Manager) resolveWorkspace(projectName, workspace string, noWorkspace bool, scheduleKind string) (string, bool, error) {
 	if noWorkspace {
-		return "", false, nil
+		return "", false, errors.New("--no-workspace is not supported; recurring Codex schedules require --project")
 	}
 	if strings.TrimSpace(projectName) != "" && strings.TrimSpace(workspace) != "" {
 		return "", false, errors.New("--project and --workspace cannot be combined")
@@ -681,16 +695,182 @@ func (m *Manager) resolveWorkspace(projectName, workspace string, noWorkspace bo
 		if err != nil {
 			return "", false, err
 		}
+		if err := validateWorkspaceDir(project.Path); err != nil {
+			return "", false, err
+		}
 		return project.Path, true, nil
+	}
+	if scheduleKind == "recurring" {
+		if strings.TrimSpace(workspace) != "" {
+			return "", false, errors.New("recurring Codex schedules require --project; run declaw track <name> --path <dir> first for an existing directory")
+		}
+		return "", false, errors.New("recurring Codex schedules require --project")
 	}
 	if strings.TrimSpace(workspace) != "" {
 		abs, err := filepath.Abs(workspace)
 		if err != nil {
 			return "", false, err
 		}
+		if err := validateWorkspaceDir(abs); err != nil {
+			return "", false, err
+		}
 		return abs, true, nil
 	}
-	return "", false, errors.New("codex schedules require --project, --workspace, or --no-workspace")
+	if scheduleKind == "once" {
+		return m.defaultOnceWorkspace()
+	}
+	return "", false, errors.New("codex schedules require --project unless this is a one-off schedule")
+}
+
+func (m *Manager) defaultOnceWorkspace() (string, bool, error) {
+	path := filepath.Join(m.supportDir, "workspaces", "one-off")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return "", false, err
+	}
+	readmePath := filepath.Join(path, "README.md")
+	if _, err := os.Stat(readmePath); errors.Is(err, os.ErrNotExist) {
+		content := strings.Join([]string{
+			"# declaw one-off workspace",
+			"",
+			"This directory is the default workspace for one-off scheduled Codex jobs created without `--project` or `--workspace`.",
+			"",
+			"Use an explicit `--project` or `--workspace` when the job needs repo-specific context.",
+			"",
+		}, "\n")
+		if err := os.WriteFile(readmePath, []byte(content), 0o644); err != nil {
+			return "", false, err
+		}
+	}
+	return path, true, nil
+}
+
+func (m *Manager) help() string {
+	return strings.TrimSpace(`
+declaw schedule
+
+Manage native macOS launchd schedules for Codex runs and simple reminders.
+
+Commands:
+  declaw schedule list
+  declaw schedule status <job>
+  declaw schedule enable <job>
+  declaw schedule disable <job>
+  declaw schedule restart <job>
+  declaw schedule run <job>
+  declaw schedule remove <job>
+  declaw schedule remove-all
+  declaw schedule prune-once
+  declaw schedule get-prompt <job>
+  declaw schedule get-time <job>
+  declaw schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
+  declaw schedule codex <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
+  declaw schedule reminder <job> --title <text> --body <text> [schedule flags]
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--title <text>] [--body <text>]
+
+Codex schedule context:
+  Recurring Codex schedules require a declaw project. Use declaw track <name> --path <dir> for an existing directory, or declaw create <name> for a fresh workspace. One-off schedules may use --project, --workspace, or omit both to use declaw's default one-off workspace.
+
+Schedule flags:
+  --daily HH:MM
+  --weekdays HH:MM
+  --weekly mon@09:30
+  --at "YYYY-MM-DD HH:MM"        One-off schedule at an exact future time.
+  --time HH:MM
+  --once                         Make explicit --year/--month/--day fields one-off.
+  --year YYYY --month M --day D --hour H --minute M [--weekday mon]
+  --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --no-recurring-fallback
+`)
+}
+
+func (m *Manager) codexHelp() string {
+	return strings.TrimSpace(`
+declaw schedule codex
+
+Create a scheduled Codex run. Recurring jobs require a declaw project so Codex gets durable managed context. One-off jobs may omit it and use declaw's default one-off workspace.
+
+Usage:
+  declaw schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
+  declaw schedule codex <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
+
+Choose the target:
+  --project <name>      Use a declaw-tracked project from declaw list.
+  --workspace <dir>     Use an existing directory directly. Allowed only for one-off jobs.
+  omitted               Allowed only for one-off jobs; uses ~/.local/share/declaw/workspaces/one-off.
+
+If no project exists yet:
+  declaw create <name> --into <parent-dir>
+  declaw track <name> --path <existing-dir>
+  declaw schedule codex <job> --project <name> --daily HH:MM --prompt "<task>"
+
+Examples:
+  declaw schedule codex pm-review --project pm-workspace --weekdays 09:00 --prompt "Review PM deadlines, reminders, and codebase signals."
+  declaw track product-repo --path ~/Documents/dev/my-repo
+  declaw schedule codex repo-review --project product-repo --daily 10:00 --prompt "Inspect this repo and summarize PM risks and next actions."
+
+Schedule flags:
+  --daily HH:MM
+  --weekdays HH:MM
+  --weekly mon@09:30
+  --at "YYYY-MM-DD HH:MM"        One-off schedule at an exact future time.
+  --time HH:MM
+  --once                         Make explicit --year/--month/--day fields one-off.
+  --year YYYY --month M --day D --hour H --minute M [--weekday mon]
+  --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --no-recurring-fallback
+`)
+}
+
+func (m *Manager) reminderHelp() string {
+	return strings.TrimSpace(`
+declaw schedule reminder
+
+Create a scheduled macOS notification.
+
+Usage:
+  declaw schedule reminder <job> --title <text> --body <text> [schedule flags]
+
+Examples:
+  declaw schedule reminder standup --weekdays 09:45 --title "Standup" --body "Review blockers before standup."
+  declaw schedule reminder follow-up --at "2026-04-14 15:30" --title "Follow up" --body "Send PM deadline update."
+`)
+}
+
+func (m *Manager) editHelp() string {
+	return strings.TrimSpace(`
+declaw schedule edit
+
+Edit an existing schedule while preserving unspecified fields.
+
+Usage:
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--title <text>] [--body <text>]
+
+For recurring Codex jobs, switching context requires --project. For one-off Codex jobs, --workspace is also allowed.
+`)
+}
+
+func isHelpArg(value string) bool {
+	return value == "-h" || value == "--help" || value == "help"
+}
+
+func hasHelpArg(args []string) bool {
+	for _, arg := range args {
+		if isHelpArg(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateWorkspaceDir(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("workspace directory is not accessible: %s", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("workspace path is not a directory: %s", path)
+	}
+	return nil
 }
 
 func (m *Manager) installAndStore(record JobRecord) (string, error) {
@@ -709,6 +889,12 @@ func (m *Manager) installAndStore(record JobRecord) (string, error) {
 }
 
 func (m *Manager) installRecord(record JobRecord) error {
+	if record.Type == "codex" {
+		if err := m.writePromptFile(record); err != nil {
+			return err
+		}
+	}
+
 	if record.Config.Kind == "once" {
 		payload := m.buildPlist(record.OnceLabel, m.onceProgramArguments(record), record, nil)
 		return m.installJob(record.OnceLabel, payload)
@@ -730,6 +916,7 @@ func (m *Manager) installJob(label string, payload map[string]any) error {
 		return err
 	}
 	_ = m.bootout(label)
+	_ = m.enableLabel(label)
 	if err := m.bootstrap(label); err != nil {
 		return err
 	}
@@ -778,7 +965,7 @@ func (m *Manager) jobPayloadArgs(record JobRecord) []string {
 	args := []string{}
 	switch record.Type {
 	case "codex":
-		args = append(args, "--prompt", record.Prompt)
+		args = append(args, "--prompt-file", m.promptPath(record.Name))
 		if record.Workspace != "" {
 			args = append(args, "--workspace", record.Workspace)
 		}
@@ -799,6 +986,7 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	day := fs.Int("day", 0, "day")
 	month := fs.Int("month", 0, "month")
 	prompt := fs.String("prompt", "", "prompt")
+	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
 	title := fs.String("title", "", "title")
 	body := fs.String("body", "", "body")
@@ -806,6 +994,13 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	fs.Var(&weekday, "weekday", "weekday")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalRecurringValueFlags())); err != nil {
 		return err
+	}
+	if *jobType == "codex" {
+		resolvedPrompt, err := resolveRuntimePrompt(*prompt, *promptFile)
+		if err != nil {
+			return err
+		}
+		*prompt = resolvedPrompt
 	}
 
 	now := time.Now().In(time.Local)
@@ -905,11 +1100,19 @@ func (m *Manager) runOnceInternal(args []string) error {
 	cleanupLabel := fs.String("cleanup-label", "", "label")
 	jobType := fs.String("type", "", "type")
 	prompt := fs.String("prompt", "", "prompt")
+	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
 	title := fs.String("title", "", "title")
 	body := fs.String("body", "", "body")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalOnceValueFlags())); err != nil {
 		return err
+	}
+	if *jobType == "codex" {
+		resolvedPrompt, err := resolveRuntimePrompt(*prompt, *promptFile)
+		if err != nil {
+			return err
+		}
+		*prompt = resolvedPrompt
 	}
 
 	now := time.Now().In(time.Local)
@@ -965,6 +1168,7 @@ func (m *Manager) cleanupOnceJob(label string) error {
 		return err
 	}
 	delete(store.Jobs, sanitizeName(labelName(label)))
+	m.removePromptFile(labelName(label))
 	if err := m.saveJobs(store); err != nil {
 		return err
 	}
@@ -1001,39 +1205,14 @@ func (m *Manager) runCodexInternal(args []string) error {
 		_ = os.Remove(*promptFile)
 	}
 
-	if _, err := exec.LookPath("codex"); err != nil {
-		return errors.New("codex command not found in PATH")
-	}
-
-	if *workspace != "" {
-		if err := os.Chdir(*workspace); err != nil {
-			return err
-		}
-	}
-
-	argsForExec := []string{"codex", "--no-alt-screen"}
-	if *workspace != "" {
-		argsForExec = append(argsForExec, "-C", *workspace)
-	}
-	argsForExec = append(argsForExec, string(promptBytes))
-
-	if *jobName != "" {
-		fmt.Printf("Launching scheduled Codex job: %s\n", *jobName)
-	}
-	if *workspace != "" {
-		fmt.Printf("Workspace: %s\n\n", *workspace)
-	}
-	path, err := exec.LookPath("codex")
-	if err != nil {
-		return err
-	}
-	return syscall.Exec(path, argsForExec, os.Environ())
+	return runCodexDirect(string(promptBytes), *workspace, *jobName, map[string]string{})
 }
 
 func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace, title, body string, env map[string]string) int {
 	switch jobType {
 	case "codex":
-		if err := m.launchCodexInTerminal(prompt, workspace, jobName); err != nil {
+		if err := m.launchCodexInteractive(prompt, workspace, jobName, env); err != nil {
+			fmt.Fprintf(os.Stderr, "codex run failed: %s\n", err)
 			return 1
 		}
 		return 0
@@ -1049,41 +1228,118 @@ func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace, title, 
 	}
 }
 
-func (m *Manager) launchCodexInTerminal(prompt, workspace, jobName string) error {
-	tmpFile, err := os.CreateTemp("", "declaw-prompt.*.txt")
-	if err != nil {
-		return err
+func (m *Manager) launchCodexInteractive(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("missing Codex prompt")
 	}
-	if _, err := tmpFile.WriteString(prompt); err != nil {
-		tmpFile.Close()
-		return err
+	if _, err := exec.LookPath("codex"); err != nil {
+		return errors.New("codex command not found in PATH")
 	}
-	if err := tmpFile.Close(); err != nil {
+
+	runDir := extraEnv["DECLAW_RUN_DIR"]
+	if strings.TrimSpace(runDir) == "" {
+		var err error
+		runDir, err = os.MkdirTemp(m.runsDir, "codex-")
+		if err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return err
 	}
 
-	commandParts := []string{
-		shellQuote(m.executablePath),
-		"schedule",
-		"__internal",
-		"run-codex",
-		"--prompt-file",
-		shellQuote(tmpFile.Name()),
-		"--delete-prompt-file",
+	promptPath := filepath.Join(runDir, "codex-prompt.txt")
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o600); err != nil {
+		return err
 	}
+
+	scriptPath := filepath.Join(runDir, "run-codex.command")
+	script := m.codexTerminalScript(promptPath, workspace, jobName, extraEnv)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		return err
+	}
+
 	if jobName != "" {
-		commandParts = append(commandParts, "--job-name", shellQuote(jobName))
+		fmt.Printf("Opening scheduled Codex job in Terminal: %s\n", jobName)
 	}
 	if workspace != "" {
-		commandParts = append(commandParts, "--workspace", shellQuote(workspace))
+		fmt.Printf("Workspace: %s\n\n", workspace)
 	}
-	terminalCommand := strings.Join(commandParts, " ")
 
-	script := fmt.Sprintf(`tell application "Terminal"
-  activate
-  do script %q
-end tell`, terminalCommand)
-	return exec.Command(osascriptPath, "-e", script).Run()
+	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", scriptPath)
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func (m *Manager) codexTerminalScript(promptPath, workspace, jobName string, extraEnv map[string]string) string {
+	var b strings.Builder
+	b.WriteString("#!/bin/zsh\n")
+	b.WriteString("set -e\n")
+	for key, value := range extraEnv {
+		if isSafeEnvName(key) {
+			b.WriteString("export ")
+			b.WriteString(key)
+			b.WriteString("=")
+			b.WriteString(shellQuote(value))
+			b.WriteString("\n")
+		}
+	}
+	if workspace != "" {
+		b.WriteString("cd ")
+		b.WriteString(shellQuote(workspace))
+		b.WriteString("\n")
+	}
+	b.WriteString("exec ")
+	b.WriteString(shellQuote(m.executablePath))
+	b.WriteString(" schedule __internal run-codex --prompt-file ")
+	b.WriteString(shellQuote(promptPath))
+	b.WriteString(" --delete-prompt-file --job-name ")
+	b.WriteString(shellQuote(jobName))
+	if workspace != "" {
+		b.WriteString(" --workspace ")
+		b.WriteString(shellQuote(workspace))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func runCodexDirect(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("missing Codex prompt")
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		return errors.New("codex command not found in PATH")
+	}
+
+	program, args := codexCommand(prompt, workspace)
+
+	if jobName != "" {
+		fmt.Printf("Launching scheduled Codex job: %s\n", jobName)
+	}
+	if workspace != "" {
+		fmt.Printf("Workspace: %s\n\n", workspace)
+	}
+
+	cmd := exec.Command(program, args...)
+	if workspace != "" {
+		cmd.Dir = workspace
+	}
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func codexCommand(prompt, workspace string) (string, []string) {
+	codexArgs := []string{"--no-alt-screen"}
+	if workspace != "" {
+		codexArgs = append(codexArgs, "-C", workspace)
+	}
+	codexArgs = append(codexArgs, prompt)
+	return "codex", codexArgs
 }
 
 func (m *Manager) buildPlist(label string, argv []string, record JobRecord, calendarEntries []map[string]int) map[string]any {
@@ -1105,9 +1361,13 @@ func (m *Manager) buildPlist(label string, argv []string, record JobRecord, cale
 	}
 	if record.Stdout != "" {
 		payload["StandardOutPath"] = record.Stdout
+	} else {
+		payload["StandardOutPath"] = filepath.Join(m.supportDir, "logs", label+".out.log")
 	}
 	if record.Stderr != "" {
 		payload["StandardErrorPath"] = record.Stderr
+	} else {
+		payload["StandardErrorPath"] = filepath.Join(m.supportDir, "logs", label+".err.log")
 	}
 	return payload
 }
@@ -1414,7 +1674,11 @@ func (m *Manager) runLaunchctl(check bool, args ...string) *launchctlResult {
 }
 
 func (r *launchctlResult) Output() (string, error) {
-	return strings.TrimSpace(r.Stdout + r.Stderr), r.Err
+	output := strings.TrimSpace(r.Stdout + r.Stderr)
+	if r.Err != nil && output != "" {
+		return output, fmt.Errorf("%w: %s", r.Err, output)
+	}
+	return output, r.Err
 }
 
 func (m *Manager) bootout(label string) error {
@@ -1434,11 +1698,28 @@ func (m *Manager) enableLabel(label string) error {
 
 func (m *Manager) uninstallLabel(label string) error {
 	_ = m.bootout(label)
-	_, _ = m.runLaunchctl(false, "disable", fmt.Sprintf("%s/%s", m.domain, label)).Output()
 	if err := os.Remove(m.installedPlistPath(label)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+func (m *Manager) promptPath(jobName string) string {
+	return filepath.Join(m.jobsDir, sanitizeName(jobName)+".prompt.txt")
+}
+
+func (m *Manager) writePromptFile(record JobRecord) error {
+	if strings.TrimSpace(record.Prompt) == "" {
+		return errors.New("missing Codex prompt")
+	}
+	if err := os.MkdirAll(m.jobsDir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(m.promptPath(record.Name), []byte(record.Prompt), 0o600)
+}
+
+func (m *Manager) removePromptFile(jobName string) {
+	_ = os.Remove(m.promptPath(jobName))
 }
 
 func (m *Manager) simpleLabelAction(args []string, pastTense string, action func(string) error) (string, error) {
@@ -1547,6 +1828,7 @@ func internalRecurringValueFlags() map[string]bool {
 		"day":            true,
 		"month":          true,
 		"prompt":         true,
+		"prompt-file":    true,
 		"workspace":      true,
 		"title":          true,
 		"body":           true,
@@ -1560,6 +1842,7 @@ func internalOnceValueFlags() map[string]bool {
 		"cleanup-label": true,
 		"type":          true,
 		"prompt":        true,
+		"prompt-file":   true,
 		"workspace":     true,
 		"title":         true,
 		"body":          true,
@@ -1858,6 +2141,20 @@ func runtimeEnv(job, triggerKind, runDir, scheduledTime string) map[string]strin
 	return env
 }
 
+func resolveRuntimePrompt(argPrompt string, promptFile string) (string, error) {
+	if strings.TrimSpace(promptFile) != "" {
+		data, err := os.ReadFile(promptFile)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+	if envPrompt := os.Getenv(promptEnvKey); envPrompt != "" {
+		return envPrompt, nil
+	}
+	return argPrompt, nil
+}
+
 func mergeEnv(base []string, extra map[string]string) []string {
 	values := map[string]string{}
 	for _, item := range base {
@@ -1877,25 +2174,39 @@ func mergeEnv(base []string, extra map[string]string) []string {
 	return out
 }
 
+func isSafeEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
 func notificationScript(title, body string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 	return fmt.Sprintf(`display notification "%s" with title "%s"`, replacer.Replace(body), replacer.Replace(title))
 }
 
 func (m *Manager) codexLaunchCommand(prompt, workspace, jobName string) []string {
-	_ = prompt
-	args := []string{m.executablePath, "schedule", "__internal", "run-codex"}
-	if workspace != "" {
-		args = append(args, "--workspace", workspace)
+	program, args := codexCommand(prompt, workspace)
+	_ = jobName
+	if len(args) > 0 {
+		args = append([]string(nil), args...)
+		args[len(args)-1] = "<prompt from file>"
 	}
-	if jobName != "" {
-		args = append(args, "--job-name", jobName)
-	}
-	return args
-}
-
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+	return append([]string{program}, args...)
 }
 
 func upsertEnv(items []string, key, value string) []string {
