@@ -6,7 +6,7 @@ Learn about the human you are helping.
 
 - Name:
 - What to call them:
-- Pronouns:
+- Gender:
 - Timezone:
 
 ## Preferences

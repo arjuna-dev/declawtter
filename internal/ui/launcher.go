@@ -17,7 +17,10 @@ type Command struct {
 func Commands() []Command {
 	return []Command{
 		{Name: "create", Description: "Create a tracked copy of the workspace template"},
+		{Name: "template", Description: "Show workspace template information"},
 		{Name: "track", Description: "Track an existing directory as a declaw project"},
+		{Name: "checkout", Description: "Open Codex in a tracked project"},
+		{Name: "ai-agent", Description: "Open Codex as a declaw management agent"},
 		{Name: "list", Description: "List tracked projects"},
 		{Name: "path", Description: "Print a tracked project path"},
 		{Name: "remove", Description: "Remove a tracked project"},
@@ -33,27 +36,22 @@ func Commands() []Command {
 		{Name: "schedule get-prompt", Description: "Print the stored prompt for a Codex schedule"},
 		{Name: "schedule get-time", Description: "Print the stored time for a schedule"},
 		{Name: "schedule codex", Description: "Schedule a Codex run"},
-		{Name: "schedule reminder", Description: "Schedule a macOS notification reminder"},
 		{Name: "schedule edit", Description: "Edit an existing scheduled job"},
 	}
 }
 
-type Executor func(string) (string, error)
-
 type Launcher struct {
 	commands []Command
-	exec     Executor
 }
 
-func NewLauncher(commands []Command, exec Executor) *Launcher {
+func NewLauncher(commands []Command) *Launcher {
 	return &Launcher{
 		commands: commands,
-		exec:     exec,
 	}
 }
 
 func (l *Launcher) Run() (string, error) {
-	model := newLauncherModel(l.commands, l.exec)
+	model := newLauncherModel(l.commands)
 	program := tea.NewProgram(model)
 	result, err := program.Run()
 	if err != nil {
@@ -64,29 +62,18 @@ func (l *Launcher) Run() (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unexpected launcher model type")
 	}
-	if finalModel.err != nil {
-		return "", finalModel.err
-	}
-	return finalModel.output, nil
+	return finalModel.commandLine, nil
 }
 
 type launcherModel struct {
-	input     textinput.Model
-	commands  []Command
-	filtered  []Command
-	selected  int
-	executing bool
-	output    string
-	err       error
-	exec      Executor
+	input       textinput.Model
+	commands    []Command
+	filtered    []Command
+	selected    int
+	commandLine string
 }
 
-type commandResultMsg struct {
-	output string
-	err    error
-}
-
-func newLauncherModel(commands []Command, exec Executor) launcherModel {
+func newLauncherModel(commands []Command) launcherModel {
 	ti := textinput.New()
 	ti.Focus()
 	ti.Placeholder = "Type a declaw command"
@@ -96,7 +83,6 @@ func newLauncherModel(commands []Command, exec Executor) launcherModel {
 	model := launcherModel{
 		input:    ti,
 		commands: commands,
-		exec:     exec,
 	}
 	model.filtered = model.filterCommands("")
 	return model
@@ -108,11 +94,6 @@ func (m launcherModel) Init() tea.Cmd {
 
 func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case commandResultMsg:
-		m.executing = false
-		m.output = msg.output
-		m.err = msg.err
-		return m, tea.Quit
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "esc":
@@ -141,12 +122,8 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = 0
 				return m, nil
 			}
-			m.executing = true
-			commandLine := line
-			return m, func() tea.Msg {
-				output, err := m.exec(commandLine)
-				return commandResultMsg{output: output, err: err}
-			}
+			m.commandLine = line
+			return m, tea.Quit
 		}
 	}
 
@@ -196,10 +173,6 @@ func (m launcherModel) View() string {
 	}
 
 	lines = append(lines, "", hint)
-	if m.executing {
-		lines = append(lines, "", muted.Render("Running command..."))
-	}
-
 	return strings.Join(lines, "\n")
 }
 

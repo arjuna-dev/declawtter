@@ -24,7 +24,6 @@ const (
 	labelPrefix   = "com.declaw"
 	promptEnvKey  = "DECLAW_SCHEDULE_PROMPT"
 	launchctlPath = "/bin/launchctl"
-	osascriptPath = "/usr/bin/osascript"
 )
 
 const scheduledCodexPromptIntro = "You are running as a scheduled Codex job."
@@ -116,8 +115,6 @@ func (m *Manager) Execute(args []string) (string, error) {
 		return m.getTime(args[1:])
 	case "codex":
 		return m.scheduleCodex(args[1:])
-	case "reminder":
-		return m.scheduleReminder(args[1:])
 	case "edit":
 		return m.edit(args[1:])
 	case "__internal":
@@ -174,6 +171,24 @@ func (m *Manager) list(args []string) (string, error) {
 		lines = append(lines, fmt.Sprintf("%s\t%s\t%s\t%s", job.Name, job.Type, kind, label))
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+func (m *Manager) Jobs() ([]JobRecord, error) {
+	store, err := m.loadJobs()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(store.Jobs))
+	for name := range store.Jobs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]JobRecord, 0, len(names))
+	for _, name := range names {
+		out = append(out, store.Jobs[name])
+	}
+	return out, nil
 }
 
 func (m *Manager) status(args []string) (string, error) {
@@ -473,88 +488,6 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 	return m.installAndStore(record)
 }
 
-func (m *Manager) scheduleReminder(args []string) (string, error) {
-	if hasHelpArg(args) {
-		return m.reminderHelp(), nil
-	}
-
-	fs := flag.NewFlagSet("reminder", flag.ContinueOnError)
-	fs.SetOutput(bytes.NewBuffer(nil))
-
-	title := fs.String("title", "", "title")
-	body := fs.String("body", "", "body")
-	daily := fs.String("daily", "", "daily")
-	timeValue := fs.String("time", "", "time")
-	weekdays := fs.String("weekdays", "", "weekdays")
-	weekly := fs.String("weekly", "", "weekly")
-	at := fs.String("at", "", "one-off")
-	once := fs.Bool("once", false, "once")
-	year := fs.Int("year", -1, "year")
-	month := fs.Int("month", -1, "month")
-	day := fs.Int("day", -1, "day")
-	hour := fs.Int("hour", -1, "hour")
-	minute := fs.Int("minute", -1, "minute")
-	cwd := fs.String("cwd", "", "cwd")
-	stdout := fs.String("stdout", "", "stdout")
-	stderr := fs.String("stderr", "", "stderr")
-	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
-	weekday := stringListFlag{}
-	env := stringListFlag{}
-	fs.Var(&weekday, "weekday", "weekday")
-	fs.Var(&env, "env", "env")
-	if err := fs.Parse(cliargs.ReorderForFlagSet(args, scheduleValueFlags())); err != nil {
-		return "", err
-	}
-
-	rest := fs.Args()
-	if len(rest) != 1 {
-		return "", errors.New("usage: declaw schedule reminder <job> --title <text> --body <text> [schedule flags]")
-	}
-	if strings.TrimSpace(*title) == "" || strings.TrimSpace(*body) == "" {
-		return "", errors.New("--title and --body are required")
-	}
-
-	config, err := resolveScheduleConfig(scheduleShapeInput{
-		Daily:    *daily,
-		Time:     *timeValue,
-		Weekdays: *weekdays,
-		Weekly:   *weekly,
-		At:       *at,
-		Once:     *once,
-		Year:     *year,
-		Month:    *month,
-		Day:      *day,
-		Hour:     *hour,
-		Minute:   *minute,
-		Weekday:  []string(weekday),
-	})
-	if err != nil {
-		return "", err
-	}
-
-	jobName := sanitizeName(rest[0])
-	record := JobRecord{
-		Name:          jobName,
-		Type:          "reminder",
-		CreatedAt:     time.Now().UTC(),
-		Config:        config,
-		Title:         *title,
-		Body:          *body,
-		Cwd:           *cwd,
-		Stdout:        *stdout,
-		Stderr:        *stderr,
-		Env:           env,
-		HasRecovery:   config.Kind == "recurring" && !*noRecurringFallback,
-		PrimaryLabel:  primaryLabel(jobName),
-		RecoveryLabel: recoveryLabel(jobName),
-		OnceLabel:     onceLabel(jobName),
-	}
-	if config.Kind == "once" {
-		record.HasRecovery = false
-	}
-	return m.installAndStore(record)
-}
-
 func (m *Manager) edit(args []string) (string, error) {
 	if hasHelpArg(args) {
 		return m.editHelp(), nil
@@ -567,8 +500,6 @@ func (m *Manager) edit(args []string) (string, error) {
 	projectName := fs.String("project", "", "project")
 	workspace := fs.String("workspace", "", "workspace")
 	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
-	title := fs.String("title", "", "title")
-	body := fs.String("body", "", "body")
 	daily := fs.String("daily", "", "daily")
 	timeValue := fs.String("time", "", "time")
 	weekdays := fs.String("weekdays", "", "weekdays")
@@ -657,13 +588,8 @@ func (m *Manager) edit(args []string) (string, error) {
 			}
 			record.Prompt = buildCodexPrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap)
 		}
-	case "reminder":
-		if *title != "" {
-			record.Title = *title
-		}
-		if *body != "" {
-			record.Body = *body
-		}
+	default:
+		return "", fmt.Errorf("unsupported schedule type %q", record.Type)
 	}
 
 	for _, label := range labelsForJob(record) {
@@ -748,7 +674,7 @@ func (m *Manager) help() string {
 	return strings.TrimSpace(`
 declaw schedule
 
-Manage native macOS launchd schedules for Codex runs and simple reminders.
+Manage native macOS launchd schedules for Codex runs.
 
 Commands:
   declaw schedule list
@@ -764,8 +690,7 @@ Commands:
   declaw schedule get-time <job>
   declaw schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
   declaw schedule codex <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
-  declaw schedule reminder <job> --title <text> --body <text> [schedule flags]
-  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--title <text>] [--body <text>]
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>]
 
 Codex schedule context:
   Recurring Codex schedules require a declaw project. Use declaw track <name> --path <dir> for an existing directory, or declaw create <name> for a fresh workspace. One-off schedules may use --project, --workspace, or omit both to use declaw's default one-off workspace.
@@ -804,7 +729,7 @@ If no project exists yet:
   declaw schedule codex <job> --project <name> --daily HH:MM --prompt "<task>"
 
 Examples:
-  declaw schedule codex pm-review --project pm-workspace --weekdays 09:00 --prompt "Review PM deadlines, reminders, and codebase signals."
+  declaw schedule codex pm-review --project pm-workspace --weekdays 09:00 --prompt "Review PM deadlines, project risks, and codebase signals."
   declaw track product-repo --path ~/Documents/dev/my-repo
   declaw schedule codex repo-review --project product-repo --daily 10:00 --prompt "Inspect this repo and summarize PM risks and next actions."
 
@@ -821,21 +746,6 @@ Schedule flags:
 `)
 }
 
-func (m *Manager) reminderHelp() string {
-	return strings.TrimSpace(`
-declaw schedule reminder
-
-Create a scheduled macOS notification.
-
-Usage:
-  declaw schedule reminder <job> --title <text> --body <text> [schedule flags]
-
-Examples:
-  declaw schedule reminder standup --weekdays 09:45 --title "Standup" --body "Review blockers before standup."
-  declaw schedule reminder follow-up --at "2026-04-14 15:30" --title "Follow up" --body "Send PM deadline update."
-`)
-}
-
 func (m *Manager) editHelp() string {
 	return strings.TrimSpace(`
 declaw schedule edit
@@ -843,7 +753,7 @@ declaw schedule edit
 Edit an existing schedule while preserving unspecified fields.
 
 Usage:
-  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--title <text>] [--body <text>]
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>]
 
 For recurring Codex jobs, switching context requires --project. For one-off Codex jobs, --workspace is also allowed.
 `)
@@ -889,6 +799,9 @@ func (m *Manager) installAndStore(record JobRecord) (string, error) {
 }
 
 func (m *Manager) installRecord(record JobRecord) error {
+	if record.Type != "codex" {
+		return fmt.Errorf("unsupported schedule type %q", record.Type)
+	}
 	if record.Type == "codex" {
 		if err := m.writePromptFile(record); err != nil {
 			return err
@@ -969,8 +882,6 @@ func (m *Manager) jobPayloadArgs(record JobRecord) []string {
 		if record.Workspace != "" {
 			args = append(args, "--workspace", record.Workspace)
 		}
-	case "reminder":
-		args = append(args, "--title", record.Title, "--body", record.Body)
 	}
 	return args
 }
@@ -988,8 +899,6 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
-	title := fs.String("title", "", "title")
-	body := fs.String("body", "", "body")
 	weekday := stringListFlag{}
 	fs.Var(&weekday, "weekday", "weekday")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalRecurringValueFlags())); err != nil {
@@ -1048,8 +957,6 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	switch *jobType {
 	case "codex":
 		command = m.codexLaunchCommand(*prompt, *workspace, *jobName)
-	case "reminder":
-		command = []string{osascriptPath, "-e", notificationScript(*title, *body)}
 	default:
 		return fmt.Errorf("unknown recurring job type %q", *jobType)
 	}
@@ -1084,7 +991,7 @@ func (m *Manager) runRecurringInternal(args []string) error {
 		return err
 	}
 
-	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *title, *body, runtimeEnv(*jobName, *triggerKind, runDir, *scheduledTime))
+	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, runtimeEnv(*jobName, *triggerKind, runDir, *scheduledTime))
 	finishedAt := time.Now().In(time.Local)
 	return appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -1102,8 +1009,6 @@ func (m *Manager) runOnceInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
-	title := fs.String("title", "", "title")
-	body := fs.String("body", "", "body")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalOnceValueFlags())); err != nil {
 		return err
 	}
@@ -1125,8 +1030,6 @@ func (m *Manager) runOnceInternal(args []string) error {
 	switch *jobType {
 	case "codex":
 		command = m.codexLaunchCommand(*prompt, *workspace, *jobName)
-	case "reminder":
-		command = []string{osascriptPath, "-e", notificationScript(*title, *body)}
 	default:
 		return fmt.Errorf("unknown one-off job type %q", *jobType)
 	}
@@ -1144,7 +1047,7 @@ func (m *Manager) runOnceInternal(args []string) error {
 		return err
 	}
 
-	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *title, *body, runtimeEnv(*jobName, "one-off", runDir, ""))
+	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, runtimeEnv(*jobName, "one-off", runDir, ""))
 	finishedAt := time.Now().In(time.Local)
 	if err := appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -1208,18 +1111,11 @@ func (m *Manager) runCodexInternal(args []string) error {
 	return runCodexDirect(string(promptBytes), *workspace, *jobName, map[string]string{})
 }
 
-func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace, title, body string, env map[string]string) int {
+func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace string, env map[string]string) int {
 	switch jobType {
 	case "codex":
 		if err := m.launchCodexInteractive(prompt, workspace, jobName, env); err != nil {
 			fmt.Fprintf(os.Stderr, "codex run failed: %s\n", err)
-			return 1
-		}
-		return 0
-	case "reminder":
-		cmd := exec.Command(osascriptPath, "-e", notificationScript(title, body))
-		cmd.Env = mergeEnv(os.Environ(), env)
-		if err := cmd.Run(); err != nil {
 			return 1
 		}
 		return 0
@@ -1814,8 +1710,6 @@ func scheduleValueFlags() map[string]bool {
 		"stderr":    true,
 		"weekday":   true,
 		"env":       true,
-		"title":     true,
-		"body":      true,
 	}
 }
 
@@ -1830,8 +1724,6 @@ func internalRecurringValueFlags() map[string]bool {
 		"prompt":         true,
 		"prompt-file":    true,
 		"workspace":      true,
-		"title":          true,
-		"body":           true,
 		"weekday":        true,
 	}
 }
@@ -1844,8 +1736,6 @@ func internalOnceValueFlags() map[string]bool {
 		"prompt":        true,
 		"prompt-file":   true,
 		"workspace":     true,
-		"title":         true,
-		"body":          true,
 	}
 }
 
@@ -2192,11 +2082,6 @@ func shellQuote(value string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
-}
-
-func notificationScript(title, body string) string {
-	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
-	return fmt.Sprintf(`display notification "%s" with title "%s"`, replacer.Replace(body), replacer.Replace(title))
 }
 
 func (m *Manager) codexLaunchCommand(prompt, workspace, jobName string) []string {

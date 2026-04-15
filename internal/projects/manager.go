@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"declaw/internal/cliargs"
+	"declaw/internal/workspacetemplate"
 )
 
 type Project struct {
@@ -70,22 +71,22 @@ func (m *Manager) Create(args []string) (string, error) {
 		return "", errors.New("project name must contain at least one alphanumeric character")
 	}
 	sourceRoot := strings.TrimSpace(*source)
+
 	var err error
-	if sourceRoot == "" {
-		sourceRoot, err = detectSourceRoot()
-		if err != nil {
-			return "", err
-		}
-	}
-
-	sourceRoot, err = filepath.Abs(sourceRoot)
-	if err != nil {
-		return "", err
-	}
-
 	parent := strings.TrimSpace(*into)
 	if parent == "" {
-		parent = filepath.Dir(sourceRoot)
+		if sourceRoot != "" {
+			absSourceRoot, err := filepath.Abs(sourceRoot)
+			if err != nil {
+				return "", err
+			}
+			parent = filepath.Dir(absSourceRoot)
+		} else {
+			parent, err = os.Getwd()
+			if err != nil {
+				return "", err
+			}
+		}
 	}
 	parent, err = filepath.Abs(parent)
 	if err != nil {
@@ -93,9 +94,18 @@ func (m *Manager) Create(args []string) (string, error) {
 	}
 
 	target := filepath.Join(parent, name)
-	if relTarget, err := filepath.Rel(sourceRoot, target); err == nil {
-		if relTarget == "." || (!strings.HasPrefix(relTarget, ".."+string(os.PathSeparator)) && relTarget != "..") {
-			return "", fmt.Errorf("target must not be inside the source template tree: %s", target)
+	if sourceRoot != "" {
+		sourceRoot, err = filepath.Abs(sourceRoot)
+		if err != nil {
+			return "", err
+		}
+		if err := validateTemplateRoot(sourceRoot); err != nil {
+			return "", err
+		}
+		if relTarget, err := filepath.Rel(sourceRoot, target); err == nil {
+			if relTarget == "." || (!strings.HasPrefix(relTarget, ".."+string(os.PathSeparator)) && relTarget != "..") {
+				return "", fmt.Errorf("target must not be inside the source template tree: %s", target)
+			}
 		}
 	}
 	if _, err := os.Stat(target); err == nil {
@@ -110,14 +120,22 @@ func (m *Manager) Create(args []string) (string, error) {
 		return "", fmt.Errorf("project %q already exists in registry", name)
 	}
 
-	if err := copyTree(sourceRoot, target, sourceRoot); err != nil {
-		return "", err
+	projectSource := workspacetemplate.SourceName
+	if sourceRoot != "" {
+		projectSource = sourceRoot
+		if err := copyTree(sourceRoot, target, sourceRoot); err != nil {
+			return "", err
+		}
+	} else {
+		if err := workspacetemplate.Copy(target); err != nil {
+			return "", err
+		}
 	}
 
 	project := Project{
 		Name:      name,
 		Path:      target,
-		Source:    sourceRoot,
+		Source:    projectSource,
 		CreatedAt: time.Now().UTC(),
 	}
 	registry.Projects[name] = project
@@ -126,6 +144,19 @@ func (m *Manager) Create(args []string) (string, error) {
 	}
 
 	return fmt.Sprintf("created %s\n%s", name, target), nil
+}
+
+func (m *Manager) Template(args []string) (string, error) {
+	fs := flag.NewFlagSet("template", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+
+	if len(fs.Args()) != 0 {
+		return "", errors.New("usage: declaw template")
+	}
+	return "embedded workspace template compiled into declaw\nUse declaw create <name> --source <dir> only for an explicit development override.", nil
 }
 
 func (m *Manager) Track(args []string) (string, error) {
@@ -210,6 +241,24 @@ func (m *Manager) List(args []string) (string, error) {
 		lines = append(lines, fmt.Sprintf("%s\t%s", project.Name, project.Path))
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+func (m *Manager) Projects() ([]Project, error) {
+	registry, err := m.loadRegistry()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(registry.Projects))
+	for name := range registry.Projects {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]Project, 0, len(names))
+	for _, name := range names {
+		out = append(out, registry.Projects[name])
+	}
+	return out, nil
 }
 
 func (m *Manager) Path(args []string) (string, error) {
@@ -319,22 +368,12 @@ func sanitizeName(value string) string {
 	return strings.Trim(b.String(), "-.")
 }
 
-func detectSourceRoot() (string, error) {
-	candidates := []string{}
-	if cwd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, cwd)
+func validateTemplateRoot(path string) error {
+	root, ok := findTemplateRoot(path)
+	if !ok || root != path {
+		return fmt.Errorf("template source must contain README.md and WORKSPACE/: %s", path)
 	}
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Dir(exe), filepath.Dir(filepath.Dir(exe)))
-	}
-
-	for _, candidate := range candidates {
-		root, ok := findTemplateRoot(candidate)
-		if ok {
-			return root, nil
-		}
-	}
-	return "", errors.New("could not detect workspace template root; pass --source explicitly")
+	return nil
 }
 
 func findTemplateRoot(start string) (string, bool) {
@@ -407,6 +446,9 @@ func shouldSkip(rel string, info os.FileInfo) bool {
 		return true
 	}
 	if base == ".DS_Store" {
+		return true
+	}
+	if rel == "declaw" && !info.IsDir() {
 		return true
 	}
 	if base == "bin" && info.IsDir() {

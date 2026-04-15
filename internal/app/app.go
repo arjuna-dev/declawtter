@@ -3,8 +3,11 @@ package app
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
+	"declaw/internal/agentworkspace"
 	"declaw/internal/projects"
 	"declaw/internal/scheduler"
 	"declaw/internal/ui"
@@ -49,18 +52,28 @@ func (a *App) Run(args []string) int {
 }
 
 func (a *App) runInteractive() int {
-	launcher := ui.NewLauncher(ui.Commands(), func(line string) (string, error) {
-		fields, err := parseCommandLine(strings.TrimSpace(line))
-		if err != nil {
-			return "", err
-		}
-		if len(fields) == 0 {
-			return "", nil
-		}
-		return a.execute(fields)
-	})
+	commands, err := a.interactiveCommands()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 
-	output, err := launcher.Run()
+	launcher := ui.NewLauncher(commands)
+	line, err := launcher.Run()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fields, err := parseCommandLine(strings.TrimSpace(line))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if len(fields) == 0 {
+		return 0
+	}
+
+	output, err := a.execute(fields)
 	if output != "" {
 		fmt.Fprintln(os.Stdout, output)
 	}
@@ -131,8 +144,14 @@ func (a *App) execute(args []string) (string, error) {
 		return a.help(), nil
 	case "create":
 		return a.projects.Create(args[1:])
+	case "template":
+		return a.projects.Template(args[1:])
 	case "track":
 		return a.projects.Track(args[1:])
+	case "checkout":
+		return a.checkout(args[1:])
+	case "ai-agent":
+		return a.aiAgent(args[1:])
 	case "list":
 		return a.projects.List(args[1:])
 	case "path":
@@ -146,13 +165,109 @@ func (a *App) execute(args []string) (string, error) {
 	}
 }
 
+func (a *App) aiAgent(args []string) (string, error) {
+	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
+		return "usage: declaw ai-agent [prompt]\n\nOpen Codex in declaw's embedded management-agent workspace. If prompt is provided, it is passed to Codex as the starting task.", nil
+	}
+	workspace, err := declawAgentWorkspace()
+	if err != nil {
+		return "", err
+	}
+	if err := agentworkspace.Ensure(workspace); err != nil {
+		return "", err
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		return "", fmt.Errorf("codex command not found in PATH")
+	}
+
+	cmdArgs := []string{}
+	prompt := strings.TrimSpace(strings.Join(args, " "))
+	if prompt != "" {
+		cmdArgs = append(cmdArgs, prompt)
+	}
+	cmd := exec.Command("codex", cmdArgs...)
+	cmd.Dir = workspace
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	return "", cmd.Run()
+}
+
+func declawAgentWorkspace() (string, error) {
+	dataDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dataDir, "declaw", "ai-agent"), nil
+}
+
+func (a *App) interactiveCommands() ([]ui.Command, error) {
+	commands := ui.Commands()
+
+	projects, err := a.projects.Projects()
+	if err != nil {
+		return nil, err
+	}
+	for _, project := range projects {
+		commands = append(commands,
+			ui.Command{Name: "checkout " + project.Name, Description: "Open Codex in " + project.Path},
+			ui.Command{Name: "path " + project.Name, Description: "Print project path"},
+			ui.Command{Name: "remove " + project.Name, Description: "Remove or untrack project"},
+		)
+	}
+
+	jobs, err := a.schedule.Jobs()
+	if err != nil {
+		return nil, err
+	}
+	for _, job := range jobs {
+		commands = append(commands,
+			ui.Command{Name: "schedule status " + job.Name, Description: "Show launchctl status"},
+			ui.Command{Name: "schedule enable " + job.Name, Description: "Enable scheduled job"},
+			ui.Command{Name: "schedule disable " + job.Name, Description: "Disable scheduled job"},
+			ui.Command{Name: "schedule restart " + job.Name, Description: "Restart scheduled job"},
+			ui.Command{Name: "schedule run " + job.Name, Description: "Trigger job immediately"},
+			ui.Command{Name: "schedule get-prompt " + job.Name, Description: "Print stored prompt"},
+			ui.Command{Name: "schedule get-time " + job.Name, Description: "Print stored time"},
+			ui.Command{Name: "schedule remove " + job.Name, Description: "Remove scheduled job"},
+		)
+	}
+
+	return commands, nil
+}
+
+func (a *App) checkout(args []string) (string, error) {
+	if len(args) != 1 {
+		return "", fmt.Errorf("usage: declaw checkout <project>")
+	}
+	project, err := a.projects.Get(args[0])
+	if err != nil {
+		return "", err
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		return "", fmt.Errorf("codex command not found in PATH")
+	}
+
+	cmd := exec.Command("codex")
+	cmd.Dir = project.Path
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	return "", cmd.Run()
+}
+
 func (a *App) help() string {
 	return strings.TrimSpace(`
 declaw
 
 Commands:
   create <name> [--into <dir>] [--source <dir>]
+  template
   track <name> --path <dir>
+  checkout <name>
+  ai-agent [prompt]
   list
   path <name>
   remove <name>
@@ -169,8 +284,7 @@ Commands:
   schedule get-time <job>
   schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
   schedule codex <job> --prompt <text> [--project <name> | --workspace <path>] --at "YYYY-MM-DD HH:MM"
-  schedule reminder <job> --title <text> --body <text> [schedule flags]
-  schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--title <text>] [--body <text>]
+  schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>]
 
 Schedule flags:
   --daily HH:MM
@@ -193,7 +307,9 @@ Agent workflow:
 Examples:
   declaw create pm-workspace --into ~/Documents/dev
   declaw track product-repo --path ~/Documents/dev/my-repo
-  declaw schedule codex pm-deadline-review --project pm-workspace --weekdays 09:00 --prompt "Review the workspace, update the relevant CLI-managed directory, inspect the codebase context, and propose PM deadline/reminder follow-ups."
-  declaw schedule codex repo-review --project product-repo --daily 10:00 --prompt "Review this repo for PM risks, deadlines, and reminders."
+  declaw checkout pm-workspace
+  declaw ai-agent "Create a recurring Codex schedule for my PM review."
+  declaw schedule codex pm-deadline-review --project pm-workspace --weekdays 09:00 --prompt "Review the workspace, update the relevant CLI-managed directory, inspect the codebase context, and propose PM deadline follow-ups."
+  declaw schedule codex repo-review --project product-repo --daily 10:00 --prompt "Review this repo for PM risks, deadlines, and next actions."
 `)
 }
