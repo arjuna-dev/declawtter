@@ -1406,6 +1406,8 @@ func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]s
 		if message == "" {
 			continue
 		}
+		// Echo user input in color
+		fmt.Printf("\r%s %s\n", colorize("You >", ansiBlue), colorize(message, ansiBlue))
 		switch strings.ToLower(message) {
 		case "q", "quit", "exit":
 			fmt.Println("bye")
@@ -1625,7 +1627,7 @@ func printDeclawChatMessage(role, message string) {
 	if role == "" {
 		role = "Declaw"
 	}
-	color := ansiGreen
+	color := ansiGreenDim
 	if strings.EqualFold(role, "You") || strings.EqualFold(role, "User") {
 		color = ansiBlue
 		role = "You"
@@ -1657,10 +1659,11 @@ func declawAgentName(workspace string) string {
 }
 
 const (
-	ansiReset = "\x1b[0m"
-	ansiGreen = "\x1b[32m"
-	ansiBlue  = "\x1b[36m"
-	ansiDim   = "\x1b[2m"
+	ansiReset    = "\x1b[0m"
+	ansiGreen    = "\x1b[32m"
+	ansiGreenDim = "\x1b[32m\x1b[2m"  // Green + dim
+	ansiBlue     = "\x1b[36m"
+	ansiDim      = "\x1b[2m"
 )
 
 func colorize(value, color string) string {

@@ -1,6 +1,7 @@
 # ANSI Color Codes Reference
 
 ## Text Colors (Foreground)
+
 ```go
 // Basic Colors
 ansiBlack   = "\x1b[30m"
@@ -24,6 +25,7 @@ ansiBrightWhite   = "\x1b[97m"
 ```
 
 ## Background Colors
+
 ```go
 // Basic Background Colors
 ansiBgBlack   = "\x1b[40m"
@@ -47,6 +49,7 @@ ansiBgBrightWhite   = "\x1b[107m"
 ```
 
 ## Text Formatting
+
 ```go
 // Currently used:
 ansiReset = "\x1b[0m"    // Reset all formatting
