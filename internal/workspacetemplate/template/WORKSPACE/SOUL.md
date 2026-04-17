@@ -44,8 +44,7 @@ Continuity comes from:
 
 - [MEMORY](../MEMORY)
 - [SESSIONS](../SESSIONS)
-- [PROJECT_DOCUMENTS](../PROJECT_DOCUMENTS)
 - [TOOLS.md](TOOLS.md)
 - [SKILLS.md](SKILLS.md)
 
-If it matters later, write it down now.
+If it matters later, put it in the one file where it naturally belongs. Do not duplicate the same fact across workspace files.

@@ -52,36 +52,78 @@ func (a *App) Run(args []string) int {
 }
 
 func (a *App) runInteractive() int {
-	commands, err := a.interactiveCommands()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	for {
+		commands, err := a.interactiveCommands()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 
-	launcher := ui.NewLauncher(commands)
-	line, err := launcher.Run()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		launcher := ui.NewLauncher(commands)
+		result, err := launcher.Run()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		line := strings.TrimSpace(result.Line)
+		fields, err := parseCommandLine(line)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if result.Exit || len(fields) == 0 || strings.EqualFold(line, "/exit") {
+			return 0
+		}
+		if !strings.HasPrefix(fields[0], "/") {
+			output, err := a.aiAgent([]string{line})
+			if output != "" {
+				fmt.Fprintln(os.Stdout, output)
+			}
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			return 0
+		}
+		fields[0] = strings.TrimPrefix(fields[0], "/")
+
+		output, err := a.execute(fields)
+		if output != "" {
+			fmt.Fprintln(os.Stdout, output)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			if shouldExitAfterInteractiveCommand(fields) {
+				return 1
+			}
+		}
+		if shouldExitAfterInteractiveCommand(fields) {
+			return 0
+		}
+		if os.Getenv("DECLAW_LAUNCHER_ONCE") != "" {
+			return 0
+		}
+		fmt.Fprintln(os.Stdout)
 	}
-	fields, err := parseCommandLine(strings.TrimSpace(line))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+}
+
+func shouldExitAfterInteractiveCommand(fields []string) bool {
 	if len(fields) == 0 {
-		return 0
+		return false
 	}
-
-	output, err := a.execute(fields)
-	if output != "" {
-		fmt.Fprintln(os.Stdout, output)
+	switch fields[0] {
+	case "checkout", "create", "track", "remove":
+		return true
+	case "schedule":
+		if len(fields) < 2 {
+			return false
+		}
+		switch fields[1] {
+		case "remove", "remove-all", "codex", "edit":
+			return true
+		}
 	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	return 0
+	return false
 }
 
 func parseCommandLine(line string) ([]string, error) {
@@ -144,8 +186,6 @@ func (a *App) execute(args []string) (string, error) {
 		return a.help(), nil
 	case "create":
 		return a.projects.Create(args[1:])
-	case "template":
-		return a.projects.Template(args[1:])
 	case "track":
 		return a.projects.Track(args[1:])
 	case "checkout":
@@ -209,32 +249,108 @@ func (a *App) interactiveCommands() ([]ui.Command, error) {
 	if err != nil {
 		return nil, err
 	}
+	projectChildren := make([]ui.Command, 0, len(projects))
 	for _, project := range projects {
-		commands = append(commands,
-			ui.Command{Name: "checkout " + project.Name, Description: "Open Codex in " + project.Path},
-			ui.Command{Name: "path " + project.Name, Description: "Print project path"},
-			ui.Command{Name: "remove " + project.Name, Description: "Remove or untrack project"},
-		)
+		projectChildren = append(projectChildren, ui.Command{
+			Name:        project.Name,
+			Description: project.Path,
+		})
 	}
 
 	jobs, err := a.schedule.Jobs()
 	if err != nil {
 		return nil, err
 	}
+	scheduleChildren := ui.ScheduleCommands()
 	for _, job := range jobs {
-		commands = append(commands,
-			ui.Command{Name: "schedule status " + job.Name, Description: "Show launchctl status"},
-			ui.Command{Name: "schedule enable " + job.Name, Description: "Enable scheduled job"},
-			ui.Command{Name: "schedule disable " + job.Name, Description: "Disable scheduled job"},
-			ui.Command{Name: "schedule restart " + job.Name, Description: "Restart scheduled job"},
-			ui.Command{Name: "schedule run " + job.Name, Description: "Trigger job immediately"},
-			ui.Command{Name: "schedule get-prompt " + job.Name, Description: "Print stored prompt"},
-			ui.Command{Name: "schedule get-time " + job.Name, Description: "Print stored time"},
-			ui.Command{Name: "schedule remove " + job.Name, Description: "Remove scheduled job"},
-		)
+		scheduleChildren = append(scheduleChildren, ui.Command{
+			Name:        job.Name,
+			Description: fmt.Sprintf("%s %s", job.Type, job.Config.Kind),
+			Children: []ui.Command{
+				{Name: "/schedule run " + job.Name, Description: "Trigger job immediately"},
+				{Name: "/schedule status " + job.Name, Description: "Show launchctl status"},
+				{Name: "/schedule enable " + job.Name, Description: "Enable scheduled job"},
+				{Name: "/schedule disable " + job.Name, Description: "Disable scheduled job"},
+				{Name: "/schedule restart " + job.Name, Description: "Restart scheduled job"},
+				{Name: "/schedule get-prompt " + job.Name, Description: "Print stored prompt"},
+				{Name: "/schedule get-time " + job.Name, Description: "Print stored time"},
+				{Name: "/schedule remove " + job.Name, Description: "Remove scheduled job"},
+			},
+		})
+	}
+	jobChildren := make([]ui.Command, 0, len(jobs))
+	for _, job := range jobs {
+		jobChildren = append(jobChildren, ui.Command{
+			Name:        job.Name,
+			Description: fmt.Sprintf("%s %s", job.Type, job.Config.Kind),
+		})
+	}
+	scheduleJobActions := map[string]string{
+		"/schedule status":     "status",
+		"/schedule enable":     "enable",
+		"/schedule disable":    "disable",
+		"/schedule restart":    "restart",
+		"/schedule run":        "run",
+		"/schedule remove":     "remove",
+		"/schedule get-prompt": "get-prompt",
+		"/schedule get-time":   "get-time",
+	}
+	for idx := range scheduleChildren {
+		action, ok := scheduleJobActions[scheduleChildren[idx].Name]
+		if !ok {
+			continue
+		}
+		scheduleChildren[idx].Children = scheduleJobCommandChildren(action, jobChildren)
+		if len(jobChildren) == 0 {
+			scheduleChildren[idx].Description = "No installed jobs"
+		}
+	}
+
+	for idx := range commands {
+		switch commands[idx].Name {
+		case "/checkout":
+			commands[idx].Children = projectCommandChildren("checkout", projectChildren)
+			if len(projectChildren) == 0 {
+				commands[idx].Description = "No tracked projects"
+			}
+		case "/path":
+			commands[idx].Children = projectCommandChildren("path", projectChildren)
+			if len(projectChildren) == 0 {
+				commands[idx].Description = "No tracked projects"
+			}
+		case "/remove":
+			commands[idx].Children = projectCommandChildren("remove", projectChildren)
+			if len(projectChildren) == 0 {
+				commands[idx].Description = "No tracked projects"
+			}
+		case "/schedule":
+			commands[idx].Children = scheduleChildren
+		}
 	}
 
 	return commands, nil
+}
+
+func projectCommandChildren(action string, projects []ui.Command) []ui.Command {
+	children := make([]ui.Command, 0, len(projects))
+	for _, project := range projects {
+		children = append(children, ui.Command{
+			Name:        "/" + action + " " + project.Name,
+			Description: project.Description,
+		})
+	}
+	return children
+}
+
+func scheduleJobCommandChildren(action string, jobs []ui.Command) []ui.Command {
+	children := make([]ui.Command, 0, len(jobs))
+	for _, job := range jobs {
+		children = append(children, ui.Command{
+			Name:        "/schedule " + action + " " + job.Name,
+			Description: job.Description,
+		})
+	}
+	return children
 }
 
 func (a *App) checkout(args []string) (string, error) {
@@ -264,7 +380,6 @@ declaw
 
 Commands:
   create <name> [--into <dir>] [--source <dir>]
-  template
   track <name> --path <dir>
   checkout <name>
   ai-agent [prompt]
@@ -295,6 +410,7 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --ui declaw|codex              declaw is the clean chat UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 
 Agent workflow:

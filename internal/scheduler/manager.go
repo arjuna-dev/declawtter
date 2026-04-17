@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
@@ -28,9 +29,15 @@ const (
 
 const scheduledCodexPromptIntro = "You are running as a scheduled Codex job."
 
-const workspaceCodexPromptPrefix = "Use the current working directory as the workspace root.\nBefore doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting.\nBefore finishing this run, ensure `SESSIONS/` exists under the workspace root and save the whole conversation appending as you go with each message to a markdown file in `SESSIONS/` using a timestamped filename such as `YYYY-MM-DDTHH-MM-SS.md`."
+const workspaceCodexPromptPrefix = "Use the current working directory as the workspace root.\nBefore doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting.\nDeclaw records the visible chat transcript automatically. Do not create or update `SESSIONS/` files unless the user explicitly asks you to."
 
-const recurringCodexPromptPrefix = "Before starting the main task, inspect the existing session files and identify the most recent prior date that has session history. If there is not already a distilled memory markdown file for that date, ensure `MEMORY/` exists under the workspace root and create `MEMORY/YYYY-MM-DD.md` for that date with a distilled summary of that date's sessions."
+const recurringCodexPromptPrefix = "Before starting the main task, follow the workspace `AGENTS.md` memory convention. If a required prior-day memory entry is missing, create a concise distilled note in `MEMORY/` using the workspace's date format. Do not copy raw transcripts, tool logs, IDs, or long paths into memory unless that exact detail is necessary."
+
+const scheduledCodexChatHandoff = "When the initial scheduled work is done, answer the user directly in this chat. Write like you are texting a colleague who did not see your prompt, tool calls, or hidden reasoning. Start with enough context for the user to understand why this message exists, then give the useful result. Do not make the user open files to understand the result. Mention files only as backup or trace. If the task asks for an artifact, include the artifact itself in the chat. Keep process narration brief and focus on what the user can actually use next."
+
+var declawSpinnerFrames = []string{"|", "/", "-", "\\"}
+
+const declawChatHistoryLimit = 3
 
 type Manager struct {
 	projects        *projects.Manager
@@ -236,6 +243,9 @@ func (m *Manager) restart(args []string) (string, error) {
 }
 
 func (m *Manager) runJob(args []string) (string, error) {
+	if hasHelpArg(args) {
+		return "usage: declaw schedule run <job>\n\nTrigger an installed scheduled job immediately.", nil
+	}
 	if len(args) != 1 {
 		return "", errors.New("usage: declaw schedule run <job>")
 	}
@@ -243,14 +253,65 @@ func (m *Manager) runJob(args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	label := job.PrimaryLabel
-	if job.Config.Kind == "once" {
-		label = job.OnceLabel
+	if job.Config.Kind == "recurring" {
+		if err := m.runRecurringManual(job); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("triggered %s", job.Name), nil
 	}
+	label := job.PrimaryLabel
+	label = job.OnceLabel
 	if _, err := m.runLaunchctl(true, "kickstart", "-k", fmt.Sprintf("%s/%s", m.domain, label)).Output(); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("triggered %s", label), nil
+}
+
+func (m *Manager) runRecurringManual(job JobRecord) error {
+	if job.Type != "codex" {
+		return fmt.Errorf("unsupported schedule type %q", job.Type)
+	}
+	prompt, err := resolveRuntimePrompt("", m.promptPath(job.Name))
+	if err != nil {
+		return err
+	}
+	now := time.Now().In(time.Local)
+	runDir := filepath.Join(m.runsDir, "recurring", sanitizeName(job.Name), now.Format("2006-01-02"), "manual-"+now.Format("150405"))
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return err
+	}
+	command := m.codexLaunchCommand(prompt, job.Workspace, job.Name, effectiveCodexUI(job.UI))
+	payload := map[string]any{
+		"job":            sanitizeName(job.Name),
+		"trigger_kind":   "manual",
+		"scheduled_time": job.Config.ScheduledTime,
+		"slot_key":       filepath.Base(runDir),
+		"fired_at":       now.Format(time.RFC3339),
+		"pid":            os.Getpid(),
+		"command":        command,
+	}
+	if err := writeJSON(filepath.Join(runDir, "trigger.json"), payload); err != nil {
+		return err
+	}
+	runMD := filepath.Join(runDir, "run.md")
+	if err := os.WriteFile(runMD, []byte(strings.Join([]string{
+		fmt.Sprintf("# %s Manual Run", sanitizeName(job.Name)),
+		"",
+		fmt.Sprintf("- Date: %s", now.Format("2006-01-02")),
+		fmt.Sprintf("- Fired at: %s", now.Format("2006-01-02 15:04:05 MST")),
+		fmt.Sprintf("- Command: %s", strings.Join(command, " ")),
+		"",
+		"## Result",
+		"",
+	}, "\n")), 0o644); err != nil {
+		return err
+	}
+	exitCode := m.runRuntimeCommand(job.Type, job.Name, prompt, job.Workspace, effectiveCodexUI(job.UI), runtimeEnv(job.Name, "manual", runDir, job.Config.ScheduledTime))
+	finishedAt := time.Now().In(time.Local)
+	return appendLines(runMD,
+		fmt.Sprintf("- Exit code: %d", exitCode),
+		fmt.Sprintf("- Finished at: %s", finishedAt.Format("2006-01-02 15:04:05 MST")),
+	)
 }
 
 func (m *Manager) remove(args []string) (string, error) {
@@ -423,6 +484,7 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 	cwd := fs.String("cwd", "", "cwd")
 	stdout := fs.String("stdout", "", "stdout")
 	stderr := fs.String("stderr", "", "stderr")
+	ui := fs.String("ui", "declaw", "scheduled Codex UI: declaw or codex")
 	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
 	weekday := stringListFlag{}
 	env := stringListFlag{}
@@ -438,6 +500,9 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 	}
 	if strings.TrimSpace(*prompt) == "" {
 		return "", errors.New("--prompt is required")
+	}
+	if err := validateCodexUI(*ui); err != nil {
+		return "", err
 	}
 
 	config, err := resolveScheduleConfig(scheduleShapeInput{
@@ -472,6 +537,7 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 		Config:             config,
 		Prompt:             effectivePrompt,
 		Workspace:          resolvedWorkspace,
+		UI:                 normalizeCodexUI(*ui),
 		Cwd:                *cwd,
 		Stdout:             *stdout,
 		Stderr:             *stderr,
@@ -500,6 +566,7 @@ func (m *Manager) edit(args []string) (string, error) {
 	projectName := fs.String("project", "", "project")
 	workspace := fs.String("workspace", "", "workspace")
 	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
+	ui := fs.String("ui", "", "scheduled Codex UI: declaw or codex")
 	daily := fs.String("daily", "", "daily")
 	timeValue := fs.String("time", "", "time")
 	weekdays := fs.String("weekdays", "", "weekdays")
@@ -570,6 +637,12 @@ func (m *Manager) edit(args []string) (string, error) {
 
 	switch record.Type {
 	case "codex":
+		if *ui != "" {
+			if err := validateCodexUI(*ui); err != nil {
+				return "", err
+			}
+			record.UI = normalizeCodexUI(*ui)
+		}
 		resolvedWorkspace := record.Workspace
 		workspaceBootstrap := record.WorkspaceBootstrap
 		if *projectName != "" || *workspace != "" || *noWorkspace {
@@ -704,6 +777,7 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --ui declaw|codex                 declaw is the clean chat UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 `)
 }
@@ -742,6 +816,7 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --ui declaw|codex                 declaw is the clean chat UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 `)
 }
@@ -770,6 +845,26 @@ func hasHelpArg(args []string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeCodexUI(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "declaw"
+	}
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func effectiveCodexUI(value string) string {
+	return normalizeCodexUI(value)
+}
+
+func validateCodexUI(value string) error {
+	switch normalizeCodexUI(value) {
+	case "declaw", "codex":
+		return nil
+	default:
+		return fmt.Errorf("--ui must be declaw or codex, got %q", value)
+	}
 }
 
 func validateWorkspaceDir(path string) error {
@@ -882,6 +977,7 @@ func (m *Manager) jobPayloadArgs(record JobRecord) []string {
 		if record.Workspace != "" {
 			args = append(args, "--workspace", record.Workspace)
 		}
+		args = append(args, "--ui", effectiveCodexUI(record.UI))
 	}
 	return args
 }
@@ -899,6 +995,7 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
+	ui := fs.String("ui", "declaw", "ui")
 	weekday := stringListFlag{}
 	fs.Var(&weekday, "weekday", "weekday")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalRecurringValueFlags())); err != nil {
@@ -956,7 +1053,7 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	command := []string{}
 	switch *jobType {
 	case "codex":
-		command = m.codexLaunchCommand(*prompt, *workspace, *jobName)
+		command = m.codexLaunchCommand(*prompt, *workspace, *jobName, *ui)
 	default:
 		return fmt.Errorf("unknown recurring job type %q", *jobType)
 	}
@@ -991,7 +1088,7 @@ func (m *Manager) runRecurringInternal(args []string) error {
 		return err
 	}
 
-	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, runtimeEnv(*jobName, *triggerKind, runDir, *scheduledTime))
+	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, runtimeEnv(*jobName, *triggerKind, runDir, *scheduledTime))
 	finishedAt := time.Now().In(time.Local)
 	return appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -1009,6 +1106,7 @@ func (m *Manager) runOnceInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
+	ui := fs.String("ui", "declaw", "ui")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalOnceValueFlags())); err != nil {
 		return err
 	}
@@ -1029,7 +1127,7 @@ func (m *Manager) runOnceInternal(args []string) error {
 	command := []string{}
 	switch *jobType {
 	case "codex":
-		command = m.codexLaunchCommand(*prompt, *workspace, *jobName)
+		command = m.codexLaunchCommand(*prompt, *workspace, *jobName, *ui)
 	default:
 		return fmt.Errorf("unknown one-off job type %q", *jobType)
 	}
@@ -1047,7 +1145,7 @@ func (m *Manager) runOnceInternal(args []string) error {
 		return err
 	}
 
-	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, runtimeEnv(*jobName, "one-off", runDir, ""))
+	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, runtimeEnv(*jobName, "one-off", runDir, ""))
 	finishedAt := time.Now().In(time.Local)
 	if err := appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -1088,11 +1186,13 @@ func (m *Manager) runCodexInternal(args []string) error {
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
 	jobName := fs.String("job-name", "", "job")
+	ui := fs.String("ui", "declaw", "ui")
 	deletePromptFile := fs.Bool("delete-prompt-file", false, "delete prompt file")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, map[string]bool{
 		"prompt-file": true,
 		"workspace":   true,
 		"job-name":    true,
+		"ui":          true,
 	})); err != nil {
 		return err
 	}
@@ -1108,13 +1208,13 @@ func (m *Manager) runCodexInternal(args []string) error {
 		_ = os.Remove(*promptFile)
 	}
 
-	return runCodexDirect(string(promptBytes), *workspace, *jobName, map[string]string{})
+	return runCodexWithUI(string(promptBytes), *workspace, *jobName, *ui, map[string]string{})
 }
 
-func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace string, env map[string]string) int {
+func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace, ui string, env map[string]string) int {
 	switch jobType {
 	case "codex":
-		if err := m.launchCodexInteractive(prompt, workspace, jobName, env); err != nil {
+		if err := m.launchCodex(prompt, workspace, jobName, ui, env); err != nil {
 			fmt.Fprintf(os.Stderr, "codex run failed: %s\n", err)
 			return 1
 		}
@@ -1197,8 +1297,20 @@ func (m *Manager) codexTerminalScript(promptPath, workspace, jobName string, ext
 		b.WriteString(" --workspace ")
 		b.WriteString(shellQuote(workspace))
 	}
+	b.WriteString(" --ui codex")
 	b.WriteString("\n")
 	return b.String()
+}
+
+func runCodexWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+	switch effectiveCodexUI(ui) {
+	case "codex":
+		return runCodexDirect(prompt, workspace, jobName, extraEnv)
+	case "declaw":
+		return runDeclawCodexChat(prompt, workspace, jobName, extraEnv)
+	default:
+		return fmt.Errorf("unknown Codex UI %q", ui)
+	}
 }
 
 func runCodexDirect(prompt, workspace, jobName string, extraEnv map[string]string) error {
@@ -1229,6 +1341,479 @@ func runCodexDirect(prompt, workspace, jobName string, extraEnv map[string]strin
 	return cmd.Run()
 }
 
+type codexExecEvent struct {
+	Type     string          `json:"type"`
+	ThreadID string          `json:"thread_id"`
+	Item     codexExecItem   `json:"item"`
+	Raw      json.RawMessage `json:"-"`
+}
+
+type codexExecItem struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type declawChatMessage struct {
+	Role string
+	Text string
+}
+
+func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("missing Codex prompt")
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		return errors.New("codex command not found in PATH")
+	}
+	logPath := filepath.Join(os.TempDir(), "declaw-codex-chat.err.log")
+	if runDir := envValue(extraEnv, "DECLAW_RUN_DIR"); strings.TrimSpace(runDir) != "" {
+		logPath = filepath.Join(runDir, "codex-exec.err.log")
+	}
+
+	fmt.Println("declaw")
+	fmt.Println()
+
+	agentName := declawAgentName(workspace)
+	printRecentDeclawChatHistory(workspace, agentName, declawChatHistoryLimit)
+
+	transcriptPath, err := startDeclawChatTranscript(workspace, jobName, prompt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create visible chat transcript: %s\n", err)
+	}
+
+	threadID, displayMessage, err := runCodexExecTurn("", prompt, workspace, extraEnv, logPath, agentName)
+	if err != nil {
+		return err
+	}
+	if transcriptPath != "" && displayMessage != "" {
+		_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
+	}
+	if threadID == "" {
+		return errors.New("codex exec did not return a thread id")
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print(colorize("\nYou > ", ansiBlue))
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, os.ErrClosed) {
+				return nil
+			}
+			return err
+		}
+		message := strings.TrimSpace(line)
+		if message == "" {
+			continue
+		}
+		switch strings.ToLower(message) {
+		case "q", "quit", "exit":
+			fmt.Println("bye")
+			return nil
+		case "/raw":
+			fmt.Printf("Raw Codex session: codex resume %s\n", threadID)
+			fmt.Printf("Raw log: %s\n", logPath)
+			continue
+		case "/info":
+			if jobName != "" {
+				fmt.Printf("Job: %s\n", jobName)
+			}
+			if workspace != "" {
+				fmt.Printf("Workspace: %s\n", workspace)
+			}
+			fmt.Printf("Raw log: %s\n", logPath)
+			if transcriptPath != "" {
+				fmt.Printf("Visible chat transcript: %s\n", transcriptPath)
+			}
+			continue
+		}
+
+		if transcriptPath != "" {
+			_ = appendDeclawChatMessage(transcriptPath, "User", message)
+		}
+		nextThreadID, displayMessage, err := runCodexExecTurn(threadID, message, workspace, extraEnv, logPath, agentName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "follow-up failed: %s\n", err)
+			fmt.Fprintf(os.Stderr, "You can try again, or open the raw session with /raw.\n")
+			continue
+		}
+		if transcriptPath != "" && displayMessage != "" {
+			_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
+		}
+		if nextThreadID != "" {
+			threadID = nextThreadID
+		}
+	}
+}
+
+func runCodexExecTurn(threadID, prompt, workspace string, extraEnv map[string]string, stderrPath, agentName string) (string, string, error) {
+	args := []string{"exec"}
+	if threadID != "" {
+		args = append(args, "resume", "--json", "--skip-git-repo-check")
+		args = append(args, threadID, prompt)
+	} else {
+		args = append(args, "--json", "--skip-git-repo-check")
+		if workspace != "" {
+			args = append(args, "-C", workspace)
+		}
+		args = append(args, prompt)
+	}
+
+	cmd := exec.Command("codex", args...)
+	if workspace != "" {
+		cmd.Dir = workspace
+	}
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	stderrFile, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return "", "", err
+	}
+	defer stderrFile.Close()
+	cmd.Stderr = stderrFile
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", "", err
+	}
+
+	seenThreadID := threadID
+	messages := []string{}
+	showSpinner := stdoutIsTerminal()
+	done := make(chan struct{})
+	if showSpinner {
+		go runDeclawSpinner(done)
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var event codexExecEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			continue
+		}
+		switch event.Type {
+		case "thread.started":
+			if event.ThreadID != "" {
+				seenThreadID = event.ThreadID
+			}
+		case "item.completed":
+			if event.Item.Type == "agent_message" && strings.TrimSpace(event.Item.Text) != "" {
+				messages = append(messages, strings.TrimSpace(event.Item.Text))
+			}
+		}
+	}
+	if showSpinner {
+		close(done)
+		clearDeclawSpinner()
+	}
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Wait()
+		return seenThreadID, "", err
+	}
+	if err := cmd.Wait(); err != nil {
+		return seenThreadID, "", err
+	}
+	displayMessage := selectDeclawDisplayMessage(messages)
+	if displayMessage != "" {
+		printDeclawChatMessage(agentName, displayMessage)
+	}
+	return seenThreadID, displayMessage, nil
+}
+
+func startDeclawChatTranscript(workspace, jobName, prompt string) (string, error) {
+	if strings.TrimSpace(workspace) == "" {
+		return "", nil
+	}
+	sessionsDir := filepath.Join(workspace, "SESSIONS")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		return "", err
+	}
+	now := time.Now().In(time.Local)
+	name := now.Format("2006-01-02T15-04-05") + "-declaw-chat.md"
+	path := filepath.Join(sessionsDir, name)
+	title := "# Declaw Chat " + now.Format("2006-01-02 15:04:05 MST")
+	parts := []string{title, ""}
+	if strings.TrimSpace(jobName) != "" {
+		parts = append(parts, fmt.Sprintf("- Job: `%s`", jobName))
+	}
+	parts = append(parts, fmt.Sprintf("- Workspace: `%s`", workspace), "")
+	if task := extractTaskPrompt(prompt); task != "" {
+		parts = append(parts, "## User", "", task, "")
+	}
+	return path, os.WriteFile(path, []byte(strings.Join(parts, "\n")), 0o644)
+}
+
+func appendDeclawChatMessage(path, role, message string) error {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(message) == "" {
+		return nil
+	}
+	return appendLines(path, fmt.Sprintf("## %s", role), "", strings.TrimSpace(message), "")
+}
+
+func printRecentDeclawChatHistory(workspace, agentName string, limit int) {
+	if strings.TrimSpace(workspace) == "" || limit <= 0 {
+		return
+	}
+	files, err := filepath.Glob(filepath.Join(workspace, "SESSIONS", "*-declaw-chat.md"))
+	if err != nil || len(files) == 0 {
+		return
+	}
+	sort.Strings(files)
+	if len(files) > limit {
+		files = files[len(files)-limit:]
+	}
+	fmt.Println(colorize("Recent chat", ansiDim))
+	for _, path := range files {
+		messages, err := parseDeclawChatTranscript(path)
+		if err != nil || len(messages) == 0 {
+			continue
+		}
+		fmt.Println(colorize(filepath.Base(path), ansiDim))
+		for _, message := range messages {
+			printDeclawChatMessage(normalizeTranscriptRole(message.Role, agentName), message.Text)
+		}
+	}
+	fmt.Println(colorize("End recent chat", ansiDim))
+	fmt.Println()
+}
+
+func parseDeclawChatTranscript(path string) ([]declawChatMessage, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(data), "\n")
+	messages := []declawChatMessage{}
+	currentRole := ""
+	currentLines := []string{}
+	flush := func() {
+		text := strings.TrimSpace(strings.Join(currentLines, "\n"))
+		if currentRole != "" && text != "" {
+			messages = append(messages, declawChatMessage{Role: currentRole, Text: text})
+		}
+		currentLines = nil
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "## ") {
+			flush()
+			currentRole = strings.TrimSpace(strings.TrimPrefix(line, "## "))
+			continue
+		}
+		if currentRole != "" {
+			currentLines = append(currentLines, line)
+		}
+	}
+	flush()
+	return messages, nil
+}
+
+func normalizeTranscriptRole(role, agentName string) string {
+	if strings.EqualFold(role, "Assistant") {
+		return agentName
+	}
+	if strings.EqualFold(role, "User") {
+		return "You"
+	}
+	return role
+}
+
+func printDeclawChatMessage(role, message string) {
+	role = strings.TrimSpace(role)
+	if role == "" {
+		role = "Declaw"
+	}
+	color := ansiGreen
+	if strings.EqualFold(role, "You") || strings.EqualFold(role, "User") {
+		color = ansiBlue
+		role = "You"
+	}
+	label := colorize(role+" >", color)
+	text := colorize(strings.TrimSpace(message), color)
+	fmt.Printf("\n%s %s\n", label, text)
+}
+
+func declawAgentName(workspace string) string {
+	if strings.TrimSpace(workspace) == "" {
+		return "Declaw"
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, "WORKSPACE", "IDENTITY.md"))
+	if err != nil {
+		return "Declaw"
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "- Name:") {
+			continue
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(trimmed, "- Name:"))
+		if name != "" {
+			return name
+		}
+	}
+	return "Declaw"
+}
+
+const (
+	ansiReset = "\x1b[0m"
+	ansiGreen = "\x1b[32m"
+	ansiBlue  = "\x1b[36m"
+	ansiDim   = "\x1b[2m"
+)
+
+func colorize(value, color string) string {
+	if color == "" || !stdoutIsTerminal() {
+		return value
+	}
+	return color + value + ansiReset
+}
+
+func runDeclawSpinner(done <-chan struct{}) {
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
+	idx := 0
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			fmt.Fprintf(os.Stdout, "\r%s working...", declawSpinnerFrames[idx%len(declawSpinnerFrames)])
+			idx++
+		}
+	}
+}
+
+func clearDeclawSpinner() {
+	fmt.Fprint(os.Stdout, "\r              \r")
+}
+
+func stdoutIsTerminal() bool {
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func selectDeclawDisplayMessage(messages []string) string {
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		message := strings.TrimSpace(messages[idx])
+		if message == "" {
+			continue
+		}
+		if looksLikeDeclawProcessNarration(message) && idx > 0 {
+			continue
+		}
+		return message
+	}
+	return ""
+}
+
+func looksLikeDeclawProcessNarration(message string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(message))
+	prefixes := []string{
+		"i'll ",
+		"i will ",
+		"i’m ",
+		"i am ",
+		"startup context",
+		"memory hygiene",
+		"the core workspace files",
+		"yesterday’s distilled memory",
+		"yesterday's distilled memory",
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(lowered, prefix) {
+			return true
+		}
+	}
+	return strings.Contains(lowered, "session log") && strings.Contains(lowered, "workspace")
+}
+
+func (m *Manager) launchCodex(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+	switch effectiveCodexUI(ui) {
+	case "codex":
+		return m.launchCodexInteractive(prompt, workspace, jobName, extraEnv)
+	case "declaw":
+		return m.launchDeclawCodexChat(prompt, workspace, jobName, extraEnv)
+	default:
+		return fmt.Errorf("unknown Codex UI %q", ui)
+	}
+}
+
+func (m *Manager) launchDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	runDir := extraEnv["DECLAW_RUN_DIR"]
+	if strings.TrimSpace(runDir) == "" {
+		var err error
+		runDir, err = os.MkdirTemp(m.runsDir, "codex-")
+		if err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return err
+	}
+
+	promptPath := filepath.Join(runDir, "codex-prompt.txt")
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o600); err != nil {
+		return err
+	}
+
+	scriptPath := filepath.Join(runDir, "run-declaw-chat.command")
+	script := m.declawChatTerminalScript(promptPath, workspace, jobName, extraEnv)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		return err
+	}
+
+	if jobName != "" {
+		fmt.Printf("Opening declaw chat for scheduled Codex job: %s\n", jobName)
+	}
+	if workspace != "" {
+		fmt.Printf("Workspace: %s\n\n", workspace)
+	}
+
+	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", scriptPath)
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func (m *Manager) declawChatTerminalScript(promptPath, workspace, jobName string, extraEnv map[string]string) string {
+	var b strings.Builder
+	b.WriteString("#!/bin/zsh\n")
+	b.WriteString("set -e\n")
+	for key, value := range extraEnv {
+		if isSafeEnvName(key) {
+			b.WriteString("export ")
+			b.WriteString(key)
+			b.WriteString("=")
+			b.WriteString(shellQuote(value))
+			b.WriteString("\n")
+		}
+	}
+	if workspace != "" {
+		b.WriteString("cd ")
+		b.WriteString(shellQuote(workspace))
+		b.WriteString("\n")
+	}
+	b.WriteString("exec ")
+	b.WriteString(shellQuote(m.executablePath))
+	b.WriteString(" schedule __internal run-codex --prompt-file ")
+	b.WriteString(shellQuote(promptPath))
+	b.WriteString(" --delete-prompt-file --job-name ")
+	b.WriteString(shellQuote(jobName))
+	if workspace != "" {
+		b.WriteString(" --workspace ")
+		b.WriteString(shellQuote(workspace))
+	}
+	b.WriteString(" --ui declaw")
+	b.WriteString("\n")
+	return b.String()
+}
+
 func codexCommand(prompt, workspace string) (string, []string) {
 	codexArgs := []string{"--no-alt-screen"}
 	if workspace != "" {
@@ -1236,6 +1821,18 @@ func codexCommand(prompt, workspace string) (string, []string) {
 	}
 	codexArgs = append(codexArgs, prompt)
 	return "codex", codexArgs
+}
+
+func codexCommandForUI(prompt, workspace, ui string) (string, []string) {
+	if effectiveCodexUI(ui) == "declaw" {
+		args := []string{"exec", "--json", "--skip-git-repo-check"}
+		if workspace != "" {
+			args = append(args, "-C", workspace)
+		}
+		args = append(args, prompt)
+		return "codex", args
+	}
+	return codexCommand(prompt, workspace)
 }
 
 func (m *Manager) buildPlist(label string, argv []string, record JobRecord, calendarEntries []map[string]int) map[string]any {
@@ -1504,6 +2101,7 @@ func buildCodexPrompt(prompt string, recurring bool, workspaceRoot bool) string 
 	if workspaceRoot && recurring {
 		parts = append(parts, recurringCodexPromptPrefix)
 	}
+	parts = append(parts, scheduledCodexChatHandoff)
 	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + strings.TrimSpace(prompt)
 }
 
@@ -1710,6 +2308,7 @@ func scheduleValueFlags() map[string]bool {
 		"stderr":    true,
 		"weekday":   true,
 		"env":       true,
+		"ui":        true,
 	}
 }
 
@@ -1724,6 +2323,7 @@ func internalRecurringValueFlags() map[string]bool {
 		"prompt":         true,
 		"prompt-file":    true,
 		"workspace":      true,
+		"ui":             true,
 		"weekday":        true,
 	}
 }
@@ -1736,6 +2336,7 @@ func internalOnceValueFlags() map[string]bool {
 		"prompt":        true,
 		"prompt-file":   true,
 		"workspace":     true,
+		"ui":            true,
 	}
 }
 
@@ -2064,6 +2665,13 @@ func mergeEnv(base []string, extra map[string]string) []string {
 	return out
 }
 
+func envValue(extra map[string]string, key string) string {
+	if value := extra[key]; value != "" {
+		return value
+	}
+	return os.Getenv(key)
+}
+
 func isSafeEnvName(name string) bool {
 	if name == "" {
 		return false
@@ -2084,8 +2692,8 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
-func (m *Manager) codexLaunchCommand(prompt, workspace, jobName string) []string {
-	program, args := codexCommand(prompt, workspace)
+func (m *Manager) codexLaunchCommand(prompt, workspace, jobName, ui string) []string {
+	program, args := codexCommandForUI(prompt, workspace, ui)
 	_ = jobName
 	if len(args) > 0 {
 		args = append([]string(nil), args...)

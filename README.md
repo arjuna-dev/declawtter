@@ -12,7 +12,6 @@
 ```sh
 declaw
 declaw create my-workspace
-declaw template
 declaw list
 declaw path my-workspace
 cd "$(declaw path my-workspace)"
@@ -22,6 +21,8 @@ declaw ai-agent "Create a recurring Codex schedule for my PM review."
 declaw schedule codex morning-review --project my-workspace --daily 09:30 --prompt "Review the repo and summarize blockers."
 declaw schedule list
 ```
+
+Scheduled Codex jobs use declaw's clean terminal chat UI by default. Pass `--ui codex` when you want the raw Codex TUI instead.
 
 For agent-created recurring Codex jobs, always choose or register the project first:
 

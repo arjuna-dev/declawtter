@@ -8,7 +8,6 @@ This is a declaw assistant workspace.
 - `WORKSPACE/`: identity, user, soul, tools, and reusable skills context
 - `MEMORY/`: distilled day-level memory summaries
 - `SESSIONS/`: raw session history
-- `PROJECT_DOCUMENTS/`: durable project artifacts
 - `LOGS/`: local logs and operational output
 
 ## Scheduling

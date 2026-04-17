@@ -12,7 +12,6 @@ Before doing anything else:
 4. Review the last two entries in [MEMORY](MEMORY) if they exist.
 5. Check whether yesterday already has a memory summary in `MEMORY/DD.MM.YYYY.md`.
 6. If yesterday is missing, distill it from the relevant files in [SESSIONS](SESSIONS) and write the missing memory entry before moving on.
-7. Scan [PROJECT_DOCUMENTS](PROJECT_DOCUMENTS) for available durable project context. Do not drill down unless that context is needed.
 
 Do not wait for the user to remind you about missing memory hygiene. Do it proactively.
 
@@ -23,15 +22,23 @@ This workspace has two different forms of memory:
 - [SESSIONS](SESSIONS): raw session history and logs
 - [MEMORY](MEMORY): distilled day-level summaries in `DD.MM.YYYY.md`
 
-`MEMORY/` should be a distilled view of what happened in `SESSIONS/`, not a duplicate dump.
+`SESSIONS/` is owned by declaw's visible chat logger. Do not create, rewrite, summarize, or polish session files unless the user explicitly asks you to.
 
-Write things down. Do not rely on mental notes. If something should persist across sessions, put it in a file.
+`MEMORY/` should be a short distilled view of what happened in `SESSIONS/`, not a duplicate dump. Keep it compact. Do not copy database IDs, long paths, command transcripts, or operational notes into memory unless that exact fact is the point.
 
-## Projects
+## Context Hygiene
 
-Use [PROJECT_DOCUMENTS](PROJECT_DOCUMENTS) for durable project-specific context.
+Avoid context sprawl. Every durable fact should have one natural home:
 
-If you find useful context that should survive beyond the current chat, store it in the relevant project directory, create a new project directory if needed, and keep artifacts readable and lightweight.
+- `WORKSPACE/SOUL.md`: purpose, behavior, boundaries, and operating style.
+- `WORKSPACE/USER.md`: user preferences and stable personal/work context.
+- `WORKSPACE/TOOLS.md`: stable local tool and environment facts.
+- `WORKSPACE/SKILLS.md`: reusable workflows and playbooks.
+- `MEMORY/`: compact day-level summaries.
+
+Do not duplicate the same fact across these files. Do not use workspace files as a scratchpad. If a fact is volatile, exploratory, or only useful for the current run, keep it in the chat.
+
+Only create standalone markdown artifacts when the user asked for an artifact or when the result is clearly valuable as a document in its own right. In that case, tell the user in chat what was created and include the useful result directly in chat too.
 
 ## Tools And Skills
 
@@ -49,6 +56,7 @@ When a user asks to schedule future work:
 - always pass `--project <name>` for recurring Codex schedules
 - if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
 - for one-off Codex schedules only, `--workspace <path>` or no target is allowed
+- scheduled Codex jobs use declaw's clean terminal chat UI by default; use `--ui codex` only when raw Codex TUI output is wanted
 - only schedule future work when Codex should run
 
 ## Declaw CLI
@@ -83,6 +91,8 @@ Use `declaw schedule codex ...` when the user wants future Codex work to run by 
 - Be resourceful before asking questions.
 - React like a human when tone matters.
 - Keep responses direct, useful, and grounded.
+- For scheduled jobs, write as if the user just received a message from a colleague and did not see the prompt, hidden reasoning, or tool output.
+- Start scheduled-job results with enough context for the user to understand why the message exists.
 - Do not overdo personality, but do not sound robotic either.
 
 ## Final Principle
@@ -92,6 +102,6 @@ This repository is a reusable assistant workspace.
 Make the workspace more useful over time:
 
 - keep memory current
-- keep project context organized
+- keep context organized
 - leave behind better structure than you found
-- update `AGENTS.md` and the files under `WORKSPACE/` when stable workflow knowledge changes
+- update `AGENTS.md` and the files under `WORKSPACE/` only when stable workflow knowledge changes

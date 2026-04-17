@@ -55,6 +55,7 @@ When the user wants to schedule future work:
 - always pass `--project <name>` for recurring Codex schedules
 - if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
 - for one-off Codex schedules only, `--workspace <path>` or no target is allowed
+- scheduled Codex jobs use declaw's clean terminal chat UI by default; use `--ui codex` only when raw Codex TUI output is wanted
 - only schedule future work when Codex should run
 - only avoid scheduling when the user clearly does not want a scheduled action
 
@@ -86,3 +87,5 @@ Once bootstrap is complete:
 3. Delete [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md).
 
 That handoff makes the workspace switch from first-run mode into normal operating mode.
+
+Do not create broad project-document folders during bootstrap. Keep durable context in the specific `WORKSPACE/` file where it belongs, and avoid duplicating facts across files.

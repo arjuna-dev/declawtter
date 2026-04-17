@@ -20,6 +20,7 @@ type JobRecord struct {
 	Config             ScheduleConfig `json:"config"`
 	Prompt             string         `json:"prompt,omitempty"`
 	Workspace          string         `json:"workspace,omitempty"`
+	UI                 string         `json:"ui,omitempty"`
 	Cwd                string         `json:"cwd,omitempty"`
 	Stdout             string         `json:"stdout,omitempty"`
 	Stderr             string         `json:"stderr,omitempty"`

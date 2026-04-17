@@ -50,7 +50,9 @@ Rules:
 - Recurring Codex schedules require `--project <name>`.
 - If the target directory exists but is not tracked, run `declaw track <name> --path <dir>` first.
 - One-off Codex schedules may use `--project <name>`, `--workspace <path>`, or no target. If no target is provided, declaw uses its default one-off workspace.
+- Scheduled Codex jobs use declaw's clean terminal chat UI by default. Use `--ui codex` only when the user explicitly wants the raw Codex TUI.
 - Only create a Codex schedule when the user wants future Codex work to run.
+- Write scheduled prompts as future-facing instructions, not terse notes. Include enough context that the eventual chat output makes sense to the user without seeing the setup conversation.
 - Use `declaw schedule codex -h` or `declaw schedule -h` when unsure.
 
 ## Safety
@@ -66,4 +68,4 @@ Rules:
 - Use exact project names from `declaw list`.
 - Use absolute paths when registering existing directories.
 - If a scheduling request is ambiguous, ask one concise clarification before creating a job.
-- If the user asks for a scheduled Codex job, ensure the job has enough prompt detail to be useful when it fires later.
+- If the user asks for a scheduled Codex job, ensure the job has enough prompt detail to be useful when it fires later and tells Codex to answer in chat like a colleague who knows the user did not see the hidden setup process.
