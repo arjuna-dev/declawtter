@@ -22,7 +22,7 @@ declaw schedule codex morning-review --project my-workspace --daily 09:30 --prom
 declaw schedule list
 ```
 
-Scheduled Codex jobs use declaw's clean terminal chat UI by default. Pass `--ui codex` when you want the raw Codex TUI instead.
+Scheduled Codex jobs use declaw's app-server chat UI by default. Pass `--ui declaw` for the legacy `codex exec` chat UI, or `--ui codex` when you want the raw Codex TUI instead.
 
 For agent-created recurring Codex jobs, always choose or register the project first:
 

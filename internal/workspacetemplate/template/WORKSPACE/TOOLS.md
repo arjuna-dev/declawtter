@@ -27,4 +27,4 @@ Use it as a cheat sheet for facts that are true in this workspace and useful acr
 - Recurring Codex schedules require `--project <name>`.
 - If an existing directory should become a recurring Codex target, use `declaw track <name> --path <dir>` first.
 - One-off Codex schedules may use `--project`, `--workspace`, or no target.
-- Scheduled Codex jobs use declaw's clean terminal chat UI by default. Use `--ui codex` only when raw Codex TUI output is wanted.
+- Scheduled Codex jobs use declaw's app-server chat UI by default. Use `--ui declaw` for the legacy `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted.

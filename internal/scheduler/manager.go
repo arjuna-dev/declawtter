@@ -35,6 +35,8 @@ const recurringCodexPromptPrefix = "Before starting the main task, follow the wo
 
 const scheduledCodexChatHandoff = "When the initial scheduled work is done, answer the user directly in this chat. Write like you are texting a colleague who did not see your prompt, tool calls, or hidden reasoning. Start with enough context for the user to understand why this message exists, then give the useful result. Do not make the user open files to understand the result. Mention files only as backup or trace. If the task asks for an artifact, include the artifact itself in the chat. Keep process narration brief and focus on what the user can actually use next."
 
+const scheduledCodexLocalToolPrefix = "For scheduled non-interactive local CLI checks, prefer command flags over prompts. If using `gog` and `GOG_ACCOUNT` is set, pass `--account \"$GOG_ACCOUNT\"` explicitly; `gog` does not use that environment variable as the default account selector. Also pass `--no-input` for read-only scheduled checks so failures are explicit instead of waiting for terminal input."
+
 var declawSpinnerFrames = []string{"|", "/", "-", "\\"}
 
 const declawChatHistoryLimit = 3
@@ -306,7 +308,7 @@ func (m *Manager) runRecurringManual(job JobRecord) error {
 	}, "\n")), 0o644); err != nil {
 		return err
 	}
-	exitCode := m.runRuntimeCommand(job.Type, job.Name, prompt, job.Workspace, effectiveCodexUI(job.UI), runtimeEnv(job.Name, "manual", runDir, job.Config.ScheduledTime))
+	exitCode := m.runRuntimeCommand(job.Type, job.Name, prompt, job.Workspace, effectiveCodexUI(job.UI), m.runtimeEnvForJob(job, "manual", runDir, job.Config.ScheduledTime))
 	finishedAt := time.Now().In(time.Local)
 	return appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -484,7 +486,7 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 	cwd := fs.String("cwd", "", "cwd")
 	stdout := fs.String("stdout", "", "stdout")
 	stderr := fs.String("stderr", "", "stderr")
-	ui := fs.String("ui", "declaw", "scheduled Codex UI: declaw or codex")
+	ui := fs.String("ui", "app-server", "scheduled Codex UI: app-server, declaw, or codex")
 	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
 	weekday := stringListFlag{}
 	env := stringListFlag{}
@@ -566,7 +568,7 @@ func (m *Manager) edit(args []string) (string, error) {
 	projectName := fs.String("project", "", "project")
 	workspace := fs.String("workspace", "", "workspace")
 	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
-	ui := fs.String("ui", "", "scheduled Codex UI: declaw or codex")
+	ui := fs.String("ui", "", "scheduled Codex UI: app-server, declaw, or codex")
 	daily := fs.String("daily", "", "daily")
 	timeValue := fs.String("time", "", "time")
 	weekdays := fs.String("weekdays", "", "weekdays")
@@ -740,7 +742,7 @@ func (m *Manager) defaultOnceWorkspace() (string, bool, error) {
 			return "", false, err
 		}
 	}
-	return path, true, nil
+	return path, false, nil
 }
 
 func (m *Manager) help() string {
@@ -777,7 +779,7 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
-  --ui declaw|codex                 declaw is the clean chat UI; codex opens the raw Codex TUI.
+  --ui app-server|declaw|codex       app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 `)
 }
@@ -816,7 +818,7 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
-  --ui declaw|codex                 declaw is the clean chat UI; codex opens the raw Codex TUI.
+  --ui app-server|declaw|codex       app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 `)
 }
@@ -849,7 +851,7 @@ func hasHelpArg(args []string) bool {
 
 func normalizeCodexUI(value string) string {
 	if strings.TrimSpace(value) == "" {
-		return "declaw"
+		return "app-server"
 	}
 	return strings.ToLower(strings.TrimSpace(value))
 }
@@ -860,10 +862,10 @@ func effectiveCodexUI(value string) string {
 
 func validateCodexUI(value string) error {
 	switch normalizeCodexUI(value) {
-	case "declaw", "codex":
+	case "app-server", "declaw", "codex":
 		return nil
 	default:
-		return fmt.Errorf("--ui must be declaw or codex, got %q", value)
+		return fmt.Errorf("--ui must be app-server, declaw, or codex, got %q", value)
 	}
 }
 
@@ -995,7 +997,7 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
-	ui := fs.String("ui", "declaw", "ui")
+	ui := fs.String("ui", "app-server", "ui")
 	weekday := stringListFlag{}
 	fs.Var(&weekday, "weekday", "weekday")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalRecurringValueFlags())); err != nil {
@@ -1106,7 +1108,7 @@ func (m *Manager) runOnceInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
-	ui := fs.String("ui", "declaw", "ui")
+	ui := fs.String("ui", "app-server", "ui")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalOnceValueFlags())); err != nil {
 		return err
 	}
@@ -1145,7 +1147,11 @@ func (m *Manager) runOnceInternal(args []string) error {
 		return err
 	}
 
-	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, runtimeEnv(*jobName, "one-off", runDir, ""))
+	env := runtimeEnv(*jobName, "one-off", runDir, "")
+	if m.isDefaultOnceWorkspace(*workspace) {
+		env["DECLAW_CODEX_STATELESS"] = "1"
+	}
+	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, env)
 	finishedAt := time.Now().In(time.Local)
 	if err := appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -1186,7 +1192,7 @@ func (m *Manager) runCodexInternal(args []string) error {
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
 	jobName := fs.String("job-name", "", "job")
-	ui := fs.String("ui", "declaw", "ui")
+	ui := fs.String("ui", "app-server", "ui")
 	deletePromptFile := fs.Bool("delete-prompt-file", false, "delete prompt file")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, map[string]bool{
 		"prompt-file": true,
@@ -1308,6 +1314,8 @@ func runCodexWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]s
 		return runCodexDirect(prompt, workspace, jobName, extraEnv)
 	case "declaw":
 		return runDeclawCodexChat(prompt, workspace, jobName, extraEnv)
+	case "app-server":
+		return runCodexAppServerChat(prompt, workspace, jobName, extraEnv)
 	default:
 		return fmt.Errorf("unknown Codex UI %q", ui)
 	}
@@ -1406,8 +1414,7 @@ func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]s
 		if message == "" {
 			continue
 		}
-		// Echo user input in color
-		fmt.Printf("\r%s %s\n", colorize("You >", ansiBlue), colorize(message, ansiBlue))
+		redrawUserInput(message)
 		switch strings.ToLower(message) {
 		case "q", "quit", "exit":
 			fmt.Println("bye")
@@ -1627,7 +1634,7 @@ func printDeclawChatMessage(role, message string) {
 	if role == "" {
 		role = "Declaw"
 	}
-	color := ansiGreenDim
+	color := ansiGreen
 	if strings.EqualFold(role, "You") || strings.EqualFold(role, "User") {
 		color = ansiBlue
 		role = "You"
@@ -1635,6 +1642,13 @@ func printDeclawChatMessage(role, message string) {
 	label := colorize(role+" >", color)
 	text := colorize(strings.TrimSpace(message), color)
 	fmt.Printf("\n%s %s\n", label, text)
+}
+
+func redrawUserInput(message string) {
+	if stdinIsTerminal() && stdoutIsTerminal() {
+		fmt.Print("\x1b[1A\r\x1b[2K")
+	}
+	fmt.Printf("%s %s\n", colorize("You >", ansiBlue), colorize(message, ansiBlue))
 }
 
 func declawAgentName(workspace string) string {
@@ -1661,7 +1675,7 @@ func declawAgentName(workspace string) string {
 const (
 	ansiReset    = "\x1b[0m"
 	ansiGreen    = "\x1b[32m"
-	ansiGreenDim = "\x1b[32m\x1b[2m"  // Green + dim
+	ansiGreenDim = "\x1b[32m\x1b[2m" // Green + dim
 	ansiBlue     = "\x1b[36m"
 	ansiDim      = "\x1b[2m"
 )
@@ -1741,12 +1755,22 @@ func (m *Manager) launchCodex(prompt, workspace, jobName, ui string, extraEnv ma
 		return m.launchCodexInteractive(prompt, workspace, jobName, extraEnv)
 	case "declaw":
 		return m.launchDeclawCodexChat(prompt, workspace, jobName, extraEnv)
+	case "app-server":
+		return m.launchAppServerCodexChat(prompt, workspace, jobName, extraEnv)
 	default:
 		return fmt.Errorf("unknown Codex UI %q", ui)
 	}
 }
 
 func (m *Manager) launchDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	return m.launchCodexChatTerminal(prompt, workspace, jobName, "declaw", extraEnv)
+}
+
+func (m *Manager) launchAppServerCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	return m.launchCodexChatTerminal(prompt, workspace, jobName, "app-server", extraEnv)
+}
+
+func (m *Manager) launchCodexChatTerminal(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
 	runDir := extraEnv["DECLAW_RUN_DIR"]
 	if strings.TrimSpace(runDir) == "" {
 		var err error
@@ -1764,14 +1788,14 @@ func (m *Manager) launchDeclawCodexChat(prompt, workspace, jobName string, extra
 		return err
 	}
 
-	scriptPath := filepath.Join(runDir, "run-declaw-chat.command")
-	script := m.declawChatTerminalScript(promptPath, workspace, jobName, extraEnv)
+	scriptPath := filepath.Join(runDir, "run-"+effectiveCodexUI(ui)+"-chat.command")
+	script := m.declawChatTerminalScript(promptPath, workspace, jobName, effectiveCodexUI(ui), extraEnv)
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		return err
 	}
 
 	if jobName != "" {
-		fmt.Printf("Opening declaw chat for scheduled Codex job: %s\n", jobName)
+		fmt.Printf("Opening %s chat for scheduled Codex job: %s\n", effectiveCodexUI(ui), jobName)
 	}
 	if workspace != "" {
 		fmt.Printf("Workspace: %s\n\n", workspace)
@@ -1784,7 +1808,7 @@ func (m *Manager) launchDeclawCodexChat(prompt, workspace, jobName string, extra
 	return cmd.Run()
 }
 
-func (m *Manager) declawChatTerminalScript(promptPath, workspace, jobName string, extraEnv map[string]string) string {
+func (m *Manager) declawChatTerminalScript(promptPath, workspace, jobName, ui string, extraEnv map[string]string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/zsh\n")
 	b.WriteString("set -e\n")
@@ -1812,7 +1836,8 @@ func (m *Manager) declawChatTerminalScript(promptPath, workspace, jobName string
 		b.WriteString(" --workspace ")
 		b.WriteString(shellQuote(workspace))
 	}
-	b.WriteString(" --ui declaw")
+	b.WriteString(" --ui ")
+	b.WriteString(shellQuote(effectiveCodexUI(ui)))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -1827,12 +1852,16 @@ func codexCommand(prompt, workspace string) (string, []string) {
 }
 
 func codexCommandForUI(prompt, workspace, ui string) (string, []string) {
-	if effectiveCodexUI(ui) == "declaw" {
+	switch effectiveCodexUI(ui) {
+	case "declaw":
 		args := []string{"exec", "--json", "--skip-git-repo-check"}
 		if workspace != "" {
 			args = append(args, "-C", workspace)
 		}
 		args = append(args, prompt)
+		return "codex", args
+	case "app-server":
+		args := []string{"app-server", "--listen", "stdio://", prompt}
 		return "codex", args
 	}
 	return codexCommand(prompt, workspace)
@@ -1928,6 +1957,7 @@ func buildStandardEnv(extra []string) map[string]string {
 	if env["PATH"] == "" {
 		env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 	}
+	addPassthroughToolEnv(env)
 	for _, item := range extra {
 		parts := strings.SplitN(item, "=", 2)
 		if len(parts) == 2 {
@@ -2104,6 +2134,7 @@ func buildCodexPrompt(prompt string, recurring bool, workspaceRoot bool) string 
 	if workspaceRoot && recurring {
 		parts = append(parts, recurringCodexPromptPrefix)
 	}
+	parts = append(parts, scheduledCodexLocalToolPrefix)
 	parts = append(parts, scheduledCodexChatHandoff)
 	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + strings.TrimSpace(prompt)
 }
@@ -2632,7 +2663,42 @@ func runtimeEnv(job, triggerKind, runDir, scheduledTime string) map[string]strin
 		env["DECLAW_SCHEDULED_TIME"] = scheduledTime
 		env["AGENT_SCHEDULER_SCHEDULED_TIME"] = scheduledTime
 	}
+	addPassthroughToolEnv(env)
 	return env
+}
+
+func addPassthroughToolEnv(env map[string]string) {
+	for _, key := range []string{
+		"GOG_ACCOUNT",
+		"GOG_KEYRING_PASSWORD",
+		"GOG_ACCESS_TOKEN",
+		"NOTION_TOKEN",
+		"NOTION_API_KEY",
+		"SSH_AUTH_SOCK",
+	} {
+		if value := os.Getenv(key); value != "" {
+			env[key] = value
+		}
+	}
+}
+
+func (m *Manager) runtimeEnvForJob(job JobRecord, triggerKind, runDir, scheduledTime string) map[string]string {
+	env := runtimeEnv(job.Name, triggerKind, runDir, scheduledTime)
+	if job.Config.Kind == "once" && !job.WorkspaceBootstrap {
+		env["DECLAW_CODEX_STATELESS"] = "1"
+	}
+	return env
+}
+
+func (m *Manager) isDefaultOnceWorkspace(workspace string) bool {
+	if strings.TrimSpace(workspace) == "" {
+		return false
+	}
+	abs, err := filepath.Abs(workspace)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(abs) == filepath.Join(m.supportDir, "workspaces", "one-off")
 }
 
 func resolveRuntimePrompt(argPrompt string, promptFile string) (string, error) {

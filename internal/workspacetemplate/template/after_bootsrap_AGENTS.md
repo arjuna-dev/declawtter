@@ -56,7 +56,7 @@ When a user asks to schedule future work:
 - always pass `--project <name>` for recurring Codex schedules
 - if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
 - for one-off Codex schedules only, `--workspace <path>` or no target is allowed
-- scheduled Codex jobs use declaw's clean terminal chat UI by default; use `--ui codex` only when raw Codex TUI output is wanted
+- scheduled Codex jobs use declaw's app-server chat UI by default; use `--ui declaw` for the legacy `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted
 - only schedule future work when Codex should run
 
 ## Declaw CLI

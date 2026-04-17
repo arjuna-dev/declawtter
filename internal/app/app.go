@@ -410,7 +410,7 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
-  --ui declaw|codex              declaw is the clean chat UI; codex opens the raw Codex TUI.
+  --ui app-server|declaw|codex   app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 
 Agent workflow:
