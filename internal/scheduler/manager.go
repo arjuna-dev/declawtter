@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -769,6 +770,7 @@ Commands:
 
 Codex schedule context:
   Recurring Codex schedules require a declaw project. Use declaw track <name> --path <dir> for an existing directory, or declaw create <name> for a fresh workspace. One-off schedules may use --project, --workspace, or omit both to use declaw's default one-off workspace.
+  In scheduled chat follow-ups, Enter sends, Ctrl+J inserts a line break, and long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
 
 Schedule flags:
   --daily HH:MM
@@ -798,6 +800,9 @@ Choose the target:
   --project <name>      Use a declaw-tracked project from declaw list.
   --workspace <dir>     Use an existing directory directly. Allowed only for one-off jobs.
   omitted               Allowed only for one-off jobs; uses ~/.local/share/declaw/workspaces/one-off.
+
+Scheduled chat follow-ups:
+  Enter sends. Ctrl+J inserts a line break. Long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
 
 If no project exists yet:
   declaw create <name> --into <parent-dir>
@@ -1400,21 +1405,19 @@ func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]s
 		return errors.New("codex exec did not return a thread id")
 	}
 
-	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print(colorize("\nYou > ", ansiBlue))
-		line, err := reader.ReadString('\n')
+		input, err := readDeclawChatInput()
 		if err != nil {
-			if errors.Is(err, os.ErrClosed) {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
-		message := strings.TrimSpace(line)
+		message := input.Message
 		if message == "" {
 			continue
 		}
-		redrawUserInput(message)
+		redrawUserInput(input.Display)
 		switch strings.ToLower(message) {
 		case "q", "quit", "exit":
 			fmt.Println("bye")

@@ -93,21 +93,19 @@ func runCodexAppServerChat(prompt, workspace, jobName string, extraEnv map[strin
 		}
 	}
 
-	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print(colorize("\nYou > ", ansiBlue))
-		line, err := reader.ReadString('\n')
+		input, err := readDeclawChatInput()
 		if err != nil {
-			if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
-		message := strings.TrimSpace(line)
+		message := input.Message
 		if message == "" {
 			continue
 		}
-		redrawUserInput(message)
+		redrawUserInput(input.Display)
 		switch strings.ToLower(message) {
 		case "q", "quit", "exit":
 			fmt.Println("bye")

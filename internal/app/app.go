@@ -413,6 +413,9 @@ Schedule flags:
   --ui app-server|declaw|codex   app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 
+Scheduled chat follow-ups:
+  Enter sends. Ctrl+J inserts a line break. Long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
+
 Agent workflow:
   1. For a recurring Codex job, first choose a declaw project.
   2. If the target directory already exists, run declaw track <name> --path <dir>, then use --project <name>.
