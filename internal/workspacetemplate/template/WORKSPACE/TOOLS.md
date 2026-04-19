@@ -24,7 +24,9 @@ Use it as a cheat sheet for facts that are true in this workspace and useful acr
 - `declaw` is the main local CLI for this workspace.
 - Use `declaw checkout <project>` to open Codex in a tracked project context.
 - Use `declaw schedule codex ...` for scheduled Codex jobs.
-- Recurring Codex schedules require `--project <name>`.
-- If an existing directory should become a recurring Codex target, use `declaw track <name> --path <dir>` first.
-- One-off Codex schedules may use `--project`, `--workspace`, or no target.
+- Use `declaw schedule claude ...` for scheduled Claude Code jobs.
+- Recurring agent schedules require `--project <name>`.
+- If an existing directory should become a recurring agent target, use `declaw track <name> --path <dir>` first.
+- One-off agent schedules may use `--project`, `--workspace`, or no target.
 - Scheduled Codex jobs use declaw's app-server chat UI by default. Use `--ui declaw` for the legacy `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted.
+- Scheduled Claude jobs use the raw Claude TUI by default. Use `--ui print` for headless `claude -p` runs.

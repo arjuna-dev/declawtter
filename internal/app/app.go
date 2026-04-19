@@ -119,7 +119,7 @@ func shouldExitAfterInteractiveCommand(fields []string) bool {
 			return false
 		}
 		switch fields[1] {
-		case "remove", "remove-all", "codex", "edit":
+		case "remove", "remove-all", "codex", "claude", "edit":
 			return true
 		}
 	}
@@ -399,7 +399,9 @@ Commands:
   schedule get-time <job>
   schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
   schedule codex <job> --prompt <text> [--project <name> | --workspace <path>] --at "YYYY-MM-DD HH:MM"
-  schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>]
+  schedule claude <job> --prompt <text> --project <name> [recurring schedule flags]
+  schedule claude <job> --prompt <text> [--project <name> | --workspace <path>] --at "YYYY-MM-DD HH:MM"
+  schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--provider codex|claude]
 
 Schedule flags:
   --daily HH:MM
@@ -410,18 +412,20 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --provider codex|claude        For edit: switch an existing agent schedule between Codex and Claude.
   --ui app-server|declaw|codex   app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
+  --ui claude|print              For Claude schedules: claude opens the raw Claude TUI; print runs headless with claude -p.
   --no-recurring-fallback
 
 Scheduled chat follow-ups:
   Enter sends. Ctrl+J inserts a line break. Long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
 
 Agent workflow:
-  1. For a recurring Codex job, first choose a declaw project.
+  1. For a recurring Codex or Claude job, first choose a declaw project.
   2. If the target directory already exists, run declaw track <name> --path <dir>, then use --project <name>.
   3. If a fresh assistant workspace is needed, run declaw create <name> --into <parent-dir>, then use --project <name>.
-  4. For one-off Codex jobs only, --project/--workspace may be omitted; declaw uses ~/.local/share/declaw/workspaces/one-off.
-  5. Do not create recurring Codex schedules without --project; the CLI rejects that because recurring jobs need managed project context.
+  4. For one-off agent jobs only, --project/--workspace may be omitted; declaw uses ~/.local/share/declaw/workspaces/one-off.
+  5. Do not create recurring schedules without --project; the CLI rejects that because recurring jobs need managed project context.
 
 Examples:
   declaw create pm-workspace --into ~/Documents/dev
@@ -430,5 +434,6 @@ Examples:
   declaw ai-agent "Create a recurring Codex schedule for my PM review."
   declaw schedule codex pm-deadline-review --project pm-workspace --weekdays 09:00 --prompt "Review the workspace, update the relevant CLI-managed directory, inspect the codebase context, and propose PM deadline follow-ups."
   declaw schedule codex repo-review --project product-repo --daily 10:00 --prompt "Review this repo for PM risks, deadlines, and next actions."
+  declaw schedule claude repo-review --project product-repo --daily 10:00 --prompt "Review this repo with Claude and summarize risks and next actions."
 `)
 }

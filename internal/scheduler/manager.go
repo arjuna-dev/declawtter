@@ -30,6 +30,8 @@ const (
 
 const scheduledCodexPromptIntro = "You are running as a scheduled Codex job."
 
+const scheduledClaudePromptIntro = "You are running as a scheduled Claude Code job."
+
 const workspaceCodexPromptPrefix = "Use the current working directory as the workspace root.\nBefore doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting.\nDeclaw records the visible chat transcript automatically. Do not create or update `SESSIONS/` files unless the user explicitly asks you to."
 
 const recurringCodexPromptPrefix = "Before starting the main task, follow the workspace `AGENTS.md` memory convention. If a required prior-day memory entry is missing, create a concise distilled note in `MEMORY/` using the workspace's date format. Do not copy raw transcripts, tool logs, IDs, or long paths into memory unless that exact detail is necessary."
@@ -125,6 +127,8 @@ func (m *Manager) Execute(args []string) (string, error) {
 		return m.getTime(args[1:])
 	case "codex":
 		return m.scheduleCodex(args[1:])
+	case "claude":
+		return m.scheduleClaude(args[1:])
 	case "edit":
 		return m.edit(args[1:])
 	case "__internal":
@@ -146,6 +150,8 @@ func (m *Manager) internal(args []string) (string, error) {
 		return "", m.runOnceInternal(args[1:])
 	case "run-codex":
 		return "", m.runCodexInternal(args[1:])
+	case "run-claude":
+		return "", m.runClaudeInternal(args[1:])
 	default:
 		return "", fmt.Errorf("unknown internal schedule command %q", args[0])
 	}
@@ -271,7 +277,7 @@ func (m *Manager) runJob(args []string) (string, error) {
 }
 
 func (m *Manager) runRecurringManual(job JobRecord) error {
-	if job.Type != "codex" {
+	if job.Type != "codex" && job.Type != "claude" {
 		return fmt.Errorf("unsupported schedule type %q", job.Type)
 	}
 	prompt, err := resolveRuntimePrompt("", m.promptPath(job.Name))
@@ -283,7 +289,7 @@ func (m *Manager) runRecurringManual(job JobRecord) error {
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return err
 	}
-	command := m.codexLaunchCommand(prompt, job.Workspace, job.Name, effectiveCodexUI(job.UI))
+	command := m.agentLaunchCommand(job.Type, prompt, job.Workspace, job.Name, job.UI)
 	payload := map[string]any{
 		"job":            sanitizeName(job.Name),
 		"trigger_kind":   "manual",
@@ -309,7 +315,7 @@ func (m *Manager) runRecurringManual(job JobRecord) error {
 	}, "\n")), 0o644); err != nil {
 		return err
 	}
-	exitCode := m.runRuntimeCommand(job.Type, job.Name, prompt, job.Workspace, effectiveCodexUI(job.UI), m.runtimeEnvForJob(job, "manual", runDir, job.Config.ScheduledTime))
+	exitCode := m.runRuntimeCommand(job.Type, job.Name, prompt, job.Workspace, job.UI, m.runtimeEnvForJob(job, "manual", runDir, job.Config.ScheduledTime))
 	finishedAt := time.Now().In(time.Local)
 	return appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -444,8 +450,8 @@ func (m *Manager) getPrompt(args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if job.Type != "codex" || job.Prompt == "" {
-		return "", fmt.Errorf("job %q does not have a stored Codex prompt", args[0])
+	if (job.Type != "codex" && job.Type != "claude") || job.Prompt == "" {
+		return "", fmt.Errorf("job %q does not have a stored agent prompt", args[0])
 	}
 	return job.Prompt, nil
 }
@@ -557,6 +563,102 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 	return m.installAndStore(record)
 }
 
+func (m *Manager) scheduleClaude(args []string) (string, error) {
+	if hasHelpArg(args) {
+		return m.claudeHelp(), nil
+	}
+
+	fs := flag.NewFlagSet("claude", flag.ContinueOnError)
+	fs.SetOutput(bytes.NewBuffer(nil))
+
+	prompt := fs.String("prompt", "", "prompt")
+	projectName := fs.String("project", "", "tracked project")
+	workspace := fs.String("workspace", "", "workspace path")
+	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Claude schedules require --project")
+	daily := fs.String("daily", "", "daily time")
+	timeValue := fs.String("time", "", "daily time")
+	weekdays := fs.String("weekdays", "", "weekday time")
+	weekly := fs.String("weekly", "", "weekly")
+	at := fs.String("at", "", "one-off time")
+	once := fs.Bool("once", false, "one-off explicit schedule")
+	year := fs.Int("year", -1, "year")
+	month := fs.Int("month", -1, "month")
+	day := fs.Int("day", -1, "day")
+	hour := fs.Int("hour", -1, "hour")
+	minute := fs.Int("minute", -1, "minute")
+	cwd := fs.String("cwd", "", "cwd")
+	stdout := fs.String("stdout", "", "stdout")
+	stderr := fs.String("stderr", "", "stderr")
+	ui := fs.String("ui", "claude", "scheduled Claude UI: claude or print")
+	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
+	weekday := stringListFlag{}
+	env := stringListFlag{}
+	fs.Var(&weekday, "weekday", "weekday")
+	fs.Var(&env, "env", "env")
+	if err := fs.Parse(cliargs.ReorderForFlagSet(args, scheduleValueFlags())); err != nil {
+		return "", err
+	}
+
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return "", errors.New("usage: declaw schedule claude <job> --prompt <text> --project <name> [recurring flags] OR declaw schedule claude <job> --prompt <text> [--project <name> | --workspace <path>] --at \"YYYY-MM-DD HH:MM\"")
+	}
+	if strings.TrimSpace(*prompt) == "" {
+		return "", errors.New("--prompt is required")
+	}
+	if err := validateClaudeUI(*ui); err != nil {
+		return "", err
+	}
+
+	config, err := resolveScheduleConfig(scheduleShapeInput{
+		Daily:    *daily,
+		Time:     *timeValue,
+		Weekdays: *weekdays,
+		Weekly:   *weekly,
+		At:       *at,
+		Once:     *once,
+		Year:     *year,
+		Month:    *month,
+		Day:      *day,
+		Hour:     *hour,
+		Minute:   *minute,
+		Weekday:  []string(weekday),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	resolvedWorkspace, workspaceBootstrap, err := m.resolveWorkspace(*projectName, *workspace, *noWorkspace, config.Kind)
+	if err != nil {
+		return "", err
+	}
+
+	jobName := sanitizeName(rest[0])
+	effectivePrompt := buildClaudePrompt(*prompt, config.Kind == "recurring", workspaceBootstrap)
+	record := JobRecord{
+		Name:               jobName,
+		Type:               "claude",
+		CreatedAt:          time.Now().UTC(),
+		Config:             config,
+		Prompt:             effectivePrompt,
+		Workspace:          resolvedWorkspace,
+		UI:                 normalizeClaudeUI(*ui),
+		Cwd:                *cwd,
+		Stdout:             *stdout,
+		Stderr:             *stderr,
+		Env:                []string(env),
+		HasRecovery:        config.Kind == "recurring" && !*noRecurringFallback,
+		PrimaryLabel:       primaryLabel(jobName),
+		RecoveryLabel:      recoveryLabel(jobName),
+		OnceLabel:          onceLabel(jobName),
+		WorkspaceBootstrap: workspaceBootstrap,
+	}
+	if config.Kind == "once" {
+		record.HasRecovery = false
+	}
+	return m.installAndStore(record)
+}
+
 func (m *Manager) edit(args []string) (string, error) {
 	if hasHelpArg(args) {
 		return m.editHelp(), nil
@@ -566,6 +668,8 @@ func (m *Manager) edit(args []string) (string, error) {
 	fs.SetOutput(bytes.NewBuffer(nil))
 
 	prompt := fs.String("prompt", "", "prompt")
+	provider := fs.String("provider", "", "agent provider: codex or claude")
+	providerAlias := fs.String("type", "", "agent provider: codex or claude")
 	projectName := fs.String("project", "", "project")
 	workspace := fs.String("workspace", "", "workspace")
 	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
@@ -591,6 +695,13 @@ func (m *Manager) edit(args []string) (string, error) {
 	if len(rest) != 1 {
 		return "", errors.New("usage: declaw schedule edit <job> [flags]")
 	}
+	if *provider != "" && *providerAlias != "" && normalizeProvider(*provider) != normalizeProvider(*providerAlias) {
+		return "", errors.New("--provider and --type cannot disagree")
+	}
+	nextProvider := *provider
+	if nextProvider == "" {
+		nextProvider = *providerAlias
+	}
 
 	store, err := m.loadJobs()
 	if err != nil {
@@ -600,6 +711,15 @@ func (m *Manager) edit(args []string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unknown job %q", rest[0])
 	}
+	if nextProvider == "" {
+		nextProvider = record.Type
+	} else {
+		nextProvider = normalizeProvider(nextProvider)
+		if err := validateProvider(nextProvider); err != nil {
+			return "", err
+		}
+	}
+	providerChanged := nextProvider != record.Type
 
 	if hasScheduleShape(scheduleShapeInput{
 		Daily:    *daily,
@@ -638,13 +758,15 @@ func (m *Manager) edit(args []string) (string, error) {
 		record.Config = config
 	}
 
-	switch record.Type {
+	switch nextProvider {
 	case "codex":
 		if *ui != "" {
 			if err := validateCodexUI(*ui); err != nil {
 				return "", err
 			}
 			record.UI = normalizeCodexUI(*ui)
+		} else if providerChanged {
+			record.UI = normalizeCodexUI("")
 		}
 		resolvedWorkspace := record.Workspace
 		workspaceBootstrap := record.WorkspaceBootstrap
@@ -657,16 +779,44 @@ func (m *Manager) edit(args []string) (string, error) {
 			record.Workspace = resolvedWorkspace
 			record.WorkspaceBootstrap = workspaceBootstrap
 		}
-		if *prompt != "" || *projectName != "" || *workspace != "" || *noWorkspace {
+		if *prompt != "" || *projectName != "" || *workspace != "" || *noWorkspace || providerChanged {
 			taskPrompt := extractTaskPrompt(record.Prompt)
 			if *prompt != "" {
 				taskPrompt = *prompt
 			}
 			record.Prompt = buildCodexPrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap)
 		}
+	case "claude":
+		if *ui != "" {
+			if err := validateClaudeUI(*ui); err != nil {
+				return "", err
+			}
+			record.UI = normalizeClaudeUI(*ui)
+		} else if providerChanged {
+			record.UI = normalizeClaudeUI("")
+		}
+		resolvedWorkspace := record.Workspace
+		workspaceBootstrap := record.WorkspaceBootstrap
+		if *projectName != "" || *workspace != "" || *noWorkspace {
+			var err error
+			resolvedWorkspace, workspaceBootstrap, err = m.resolveWorkspace(*projectName, *workspace, *noWorkspace, record.Config.Kind)
+			if err != nil {
+				return "", err
+			}
+			record.Workspace = resolvedWorkspace
+			record.WorkspaceBootstrap = workspaceBootstrap
+		}
+		if *prompt != "" || *projectName != "" || *workspace != "" || *noWorkspace || providerChanged {
+			taskPrompt := extractTaskPrompt(record.Prompt)
+			if *prompt != "" {
+				taskPrompt = *prompt
+			}
+			record.Prompt = buildClaudePrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap)
+		}
 	default:
-		return "", fmt.Errorf("unsupported schedule type %q", record.Type)
+		return "", fmt.Errorf("unsupported schedule provider %q", nextProvider)
 	}
+	record.Type = nextProvider
 
 	for _, label := range labelsForJob(record) {
 		if label == "" {
@@ -687,7 +837,7 @@ func (m *Manager) edit(args []string) (string, error) {
 
 func (m *Manager) resolveWorkspace(projectName, workspace string, noWorkspace bool, scheduleKind string) (string, bool, error) {
 	if noWorkspace {
-		return "", false, errors.New("--no-workspace is not supported; recurring Codex schedules require --project")
+		return "", false, errors.New("--no-workspace is not supported; recurring schedules require --project")
 	}
 	if strings.TrimSpace(projectName) != "" && strings.TrimSpace(workspace) != "" {
 		return "", false, errors.New("--project and --workspace cannot be combined")
@@ -704,9 +854,9 @@ func (m *Manager) resolveWorkspace(projectName, workspace string, noWorkspace bo
 	}
 	if scheduleKind == "recurring" {
 		if strings.TrimSpace(workspace) != "" {
-			return "", false, errors.New("recurring Codex schedules require --project; run declaw track <name> --path <dir> first for an existing directory")
+			return "", false, errors.New("recurring schedules require --project; run declaw track <name> --path <dir> first for an existing directory")
 		}
-		return "", false, errors.New("recurring Codex schedules require --project")
+		return "", false, errors.New("recurring schedules require --project")
 	}
 	if strings.TrimSpace(workspace) != "" {
 		abs, err := filepath.Abs(workspace)
@@ -721,7 +871,7 @@ func (m *Manager) resolveWorkspace(projectName, workspace string, noWorkspace bo
 	if scheduleKind == "once" {
 		return m.defaultOnceWorkspace()
 	}
-	return "", false, errors.New("codex schedules require --project unless this is a one-off schedule")
+	return "", false, errors.New("agent schedules require --project unless this is a one-off schedule")
 }
 
 func (m *Manager) defaultOnceWorkspace() (string, bool, error) {
@@ -750,7 +900,7 @@ func (m *Manager) help() string {
 	return strings.TrimSpace(`
 declaw schedule
 
-Manage native macOS launchd schedules for Codex runs.
+Manage native macOS launchd schedules for Codex and Claude runs.
 
 Commands:
   declaw schedule list
@@ -766,10 +916,12 @@ Commands:
   declaw schedule get-time <job>
   declaw schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
   declaw schedule codex <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
-  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>]
+  declaw schedule claude <job> --prompt <text> --project <name> [recurring schedule flags]
+  declaw schedule claude <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--provider codex|claude]
 
-Codex schedule context:
-  Recurring Codex schedules require a declaw project. Use declaw track <name> --path <dir> for an existing directory, or declaw create <name> for a fresh workspace. One-off schedules may use --project, --workspace, or omit both to use declaw's default one-off workspace.
+Agent schedule context:
+  Recurring Codex and Claude schedules require a declaw project. Use declaw track <name> --path <dir> for an existing directory, or declaw create <name> for a fresh workspace. One-off schedules may use --project, --workspace, or omit both to use declaw's default one-off workspace.
   In scheduled chat follow-ups, Enter sends, Ctrl+J inserts a line break, and long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
 
 Schedule flags:
@@ -781,7 +933,9 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --provider codex|claude            For edit: switch an existing agent schedule between Codex and Claude.
   --ui app-server|declaw|codex       app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
+  --ui claude|print                  For Claude schedules: claude opens the raw Claude TUI; print runs headless with claude -p.
   --no-recurring-fallback
 `)
 }
@@ -828,6 +982,42 @@ Schedule flags:
 `)
 }
 
+func (m *Manager) claudeHelp() string {
+	return strings.TrimSpace(`
+declaw schedule claude
+
+Create a scheduled Claude Code run. Recurring jobs require a declaw project so Claude gets durable managed context. One-off jobs may omit it and use declaw's default one-off workspace.
+
+Claude schedules run with full Claude Code permissions by passing --dangerously-skip-permissions. Use this only for directories you trust.
+
+Usage:
+  declaw schedule claude <job> --prompt <text> --project <name> [recurring schedule flags]
+  declaw schedule claude <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
+
+Choose the target:
+  --project <name>      Use a declaw-tracked project from declaw list.
+  --workspace <dir>     Use an existing directory directly. Allowed only for one-off jobs.
+  omitted               Allowed only for one-off jobs; uses ~/.local/share/declaw/workspaces/one-off.
+
+Examples:
+  declaw schedule claude pm-review --project pm-workspace --weekdays 09:00 --prompt "Review PM deadlines, project risks, and codebase signals."
+  declaw track product-repo --path ~/Documents/dev/my-repo
+  declaw schedule claude repo-review --project product-repo --daily 10:00 --prompt "Inspect this repo and summarize PM risks and next actions."
+
+Schedule flags:
+  --daily HH:MM
+  --weekdays HH:MM
+  --weekly mon@09:30
+  --at "YYYY-MM-DD HH:MM"        One-off schedule at an exact future time.
+  --time HH:MM
+  --once                         Make explicit --year/--month/--day fields one-off.
+  --year YYYY --month M --day D --hour H --minute M [--weekday mon]
+  --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
+  --ui claude|print              claude opens the raw Claude TUI; print runs headless with claude -p.
+  --no-recurring-fallback
+`)
+}
+
 func (m *Manager) editHelp() string {
 	return strings.TrimSpace(`
 declaw schedule edit
@@ -835,9 +1025,11 @@ declaw schedule edit
 Edit an existing schedule while preserving unspecified fields.
 
 Usage:
-  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>]
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--provider codex|claude]
 
-For recurring Codex jobs, switching context requires --project. For one-off Codex jobs, --workspace is also allowed.
+Use --provider codex or --provider claude to switch an existing agent schedule while preserving the task prompt, timing, and workspace. If --ui is omitted during a provider switch, declaw uses the new provider's default UI.
+
+For recurring agent jobs, switching context requires --project. For one-off agent jobs, --workspace is also allowed.
 `)
 }
 
@@ -852,6 +1044,19 @@ func hasHelpArg(args []string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeProvider(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func validateProvider(value string) error {
+	switch normalizeProvider(value) {
+	case "codex", "claude":
+		return nil
+	default:
+		return fmt.Errorf("--provider must be codex or claude, got %q", value)
+	}
 }
 
 func normalizeCodexUI(value string) string {
@@ -871,6 +1076,26 @@ func validateCodexUI(value string) error {
 		return nil
 	default:
 		return fmt.Errorf("--ui must be app-server, declaw, or codex, got %q", value)
+	}
+}
+
+func normalizeClaudeUI(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "claude"
+	}
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func effectiveClaudeUI(value string) string {
+	return normalizeClaudeUI(value)
+}
+
+func validateClaudeUI(value string) error {
+	switch normalizeClaudeUI(value) {
+	case "claude", "print":
+		return nil
+	default:
+		return fmt.Errorf("--ui must be claude or print for Claude schedules, got %q", value)
 	}
 }
 
@@ -901,10 +1126,10 @@ func (m *Manager) installAndStore(record JobRecord) (string, error) {
 }
 
 func (m *Manager) installRecord(record JobRecord) error {
-	if record.Type != "codex" {
+	if record.Type != "codex" && record.Type != "claude" {
 		return fmt.Errorf("unsupported schedule type %q", record.Type)
 	}
-	if record.Type == "codex" {
+	if record.Type == "codex" || record.Type == "claude" {
 		if err := m.writePromptFile(record); err != nil {
 			return err
 		}
@@ -985,6 +1210,12 @@ func (m *Manager) jobPayloadArgs(record JobRecord) []string {
 			args = append(args, "--workspace", record.Workspace)
 		}
 		args = append(args, "--ui", effectiveCodexUI(record.UI))
+	case "claude":
+		args = append(args, "--prompt-file", m.promptPath(record.Name))
+		if record.Workspace != "" {
+			args = append(args, "--workspace", record.Workspace)
+		}
+		args = append(args, "--ui", effectiveClaudeUI(record.UI))
 	}
 	return args
 }
@@ -1002,13 +1233,13 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
-	ui := fs.String("ui", "app-server", "ui")
+	ui := fs.String("ui", "", "ui")
 	weekday := stringListFlag{}
 	fs.Var(&weekday, "weekday", "weekday")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalRecurringValueFlags())); err != nil {
 		return err
 	}
-	if *jobType == "codex" {
+	if *jobType == "codex" || *jobType == "claude" {
 		resolvedPrompt, err := resolveRuntimePrompt(*prompt, *promptFile)
 		if err != nil {
 			return err
@@ -1061,6 +1292,8 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	switch *jobType {
 	case "codex":
 		command = m.codexLaunchCommand(*prompt, *workspace, *jobName, *ui)
+	case "claude":
+		command = m.claudeLaunchCommand(*prompt, *workspace, *jobName, *ui)
 	default:
 		return fmt.Errorf("unknown recurring job type %q", *jobType)
 	}
@@ -1113,11 +1346,11 @@ func (m *Manager) runOnceInternal(args []string) error {
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
-	ui := fs.String("ui", "app-server", "ui")
+	ui := fs.String("ui", "", "ui")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalOnceValueFlags())); err != nil {
 		return err
 	}
-	if *jobType == "codex" {
+	if *jobType == "codex" || *jobType == "claude" {
 		resolvedPrompt, err := resolveRuntimePrompt(*prompt, *promptFile)
 		if err != nil {
 			return err
@@ -1135,6 +1368,8 @@ func (m *Manager) runOnceInternal(args []string) error {
 	switch *jobType {
 	case "codex":
 		command = m.codexLaunchCommand(*prompt, *workspace, *jobName, *ui)
+	case "claude":
+		command = m.claudeLaunchCommand(*prompt, *workspace, *jobName, *ui)
 	default:
 		return fmt.Errorf("unknown one-off job type %q", *jobType)
 	}
@@ -1153,7 +1388,7 @@ func (m *Manager) runOnceInternal(args []string) error {
 	}
 
 	env := runtimeEnv(*jobName, "one-off", runDir, "")
-	if m.isDefaultOnceWorkspace(*workspace) {
+	if *jobType == "codex" && m.isDefaultOnceWorkspace(*workspace) {
 		env["DECLAW_CODEX_STATELESS"] = "1"
 	}
 	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, env)
@@ -1222,11 +1457,49 @@ func (m *Manager) runCodexInternal(args []string) error {
 	return runCodexWithUI(string(promptBytes), *workspace, *jobName, *ui, map[string]string{})
 }
 
+func (m *Manager) runClaudeInternal(args []string) error {
+	fs := flag.NewFlagSet("run-claude", flag.ContinueOnError)
+	fs.SetOutput(bytes.NewBuffer(nil))
+
+	promptFile := fs.String("prompt-file", "", "prompt file")
+	workspace := fs.String("workspace", "", "workspace")
+	jobName := fs.String("job-name", "", "job")
+	ui := fs.String("ui", "claude", "ui")
+	deletePromptFile := fs.Bool("delete-prompt-file", false, "delete prompt file")
+	if err := fs.Parse(cliargs.ReorderForFlagSet(args, map[string]bool{
+		"prompt-file": true,
+		"workspace":   true,
+		"job-name":    true,
+		"ui":          true,
+	})); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(*promptFile) == "" {
+		return errors.New("missing --prompt-file")
+	}
+	promptBytes, err := os.ReadFile(*promptFile)
+	if err != nil {
+		return err
+	}
+	if *deletePromptFile {
+		_ = os.Remove(*promptFile)
+	}
+
+	return runClaudeWithUI(string(promptBytes), *workspace, *jobName, *ui, map[string]string{})
+}
+
 func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace, ui string, env map[string]string) int {
 	switch jobType {
 	case "codex":
 		if err := m.launchCodex(prompt, workspace, jobName, ui, env); err != nil {
 			fmt.Fprintf(os.Stderr, "codex run failed: %s\n", err)
+			return 1
+		}
+		return 0
+	case "claude":
+		if err := m.launchClaude(prompt, workspace, jobName, ui, env); err != nil {
+			fmt.Fprintf(os.Stderr, "claude run failed: %s\n", err)
 			return 1
 		}
 		return 0
@@ -1870,6 +2143,175 @@ func codexCommandForUI(prompt, workspace, ui string) (string, []string) {
 	return codexCommand(prompt, workspace)
 }
 
+func (m *Manager) launchClaude(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+	switch effectiveClaudeUI(ui) {
+	case "claude":
+		return m.launchClaudeInteractive(prompt, workspace, jobName, extraEnv)
+	case "print":
+		return runClaudePrint(prompt, workspace, jobName, extraEnv)
+	default:
+		return fmt.Errorf("unknown Claude UI %q", ui)
+	}
+}
+
+func (m *Manager) launchClaudeInteractive(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("missing Claude prompt")
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		return errors.New("claude command not found in PATH")
+	}
+
+	runDir := extraEnv["DECLAW_RUN_DIR"]
+	if strings.TrimSpace(runDir) == "" {
+		var err error
+		runDir, err = os.MkdirTemp(m.runsDir, "claude-")
+		if err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return err
+	}
+
+	promptPath := filepath.Join(runDir, "claude-prompt.txt")
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o600); err != nil {
+		return err
+	}
+
+	scriptPath := filepath.Join(runDir, "run-claude.command")
+	script := m.claudeTerminalScript(promptPath, workspace, jobName, extraEnv)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		return err
+	}
+
+	if jobName != "" {
+		fmt.Printf("Opening scheduled Claude job in Terminal: %s\n", jobName)
+	}
+	if workspace != "" {
+		fmt.Printf("Workspace: %s\n\n", workspace)
+	}
+
+	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", scriptPath)
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func (m *Manager) claudeTerminalScript(promptPath, workspace, jobName string, extraEnv map[string]string) string {
+	var b strings.Builder
+	b.WriteString("#!/bin/zsh\n")
+	b.WriteString("set -e\n")
+	for key, value := range extraEnv {
+		if isSafeEnvName(key) {
+			b.WriteString("export ")
+			b.WriteString(key)
+			b.WriteString("=")
+			b.WriteString(shellQuote(value))
+			b.WriteString("\n")
+		}
+	}
+	if workspace != "" {
+		b.WriteString("cd ")
+		b.WriteString(shellQuote(workspace))
+		b.WriteString("\n")
+	}
+	b.WriteString("exec ")
+	b.WriteString(shellQuote(m.executablePath))
+	b.WriteString(" schedule __internal run-claude --prompt-file ")
+	b.WriteString(shellQuote(promptPath))
+	b.WriteString(" --delete-prompt-file --job-name ")
+	b.WriteString(shellQuote(jobName))
+	if workspace != "" {
+		b.WriteString(" --workspace ")
+		b.WriteString(shellQuote(workspace))
+	}
+	b.WriteString(" --ui claude")
+	b.WriteString("\n")
+	return b.String()
+}
+
+func runClaudeWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+	switch effectiveClaudeUI(ui) {
+	case "claude":
+		return runClaudeDirect(prompt, workspace, jobName, extraEnv)
+	case "print":
+		return runClaudePrint(prompt, workspace, jobName, extraEnv)
+	default:
+		return fmt.Errorf("unknown Claude UI %q", ui)
+	}
+}
+
+func runClaudeDirect(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("missing Claude prompt")
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		return errors.New("claude command not found in PATH")
+	}
+
+	program, args := claudeCommand(prompt)
+	if jobName != "" {
+		fmt.Printf("Launching scheduled Claude job: %s\n", jobName)
+	}
+	if workspace != "" {
+		fmt.Printf("Workspace: %s\n\n", workspace)
+	}
+
+	cmd := exec.Command(program, args...)
+	if workspace != "" {
+		cmd.Dir = workspace
+	}
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runClaudePrint(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("missing Claude prompt")
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		return errors.New("claude command not found in PATH")
+	}
+
+	program, args := claudePrintCommand(prompt)
+	if jobName != "" {
+		fmt.Printf("Launching scheduled Claude print job: %s\n", jobName)
+	}
+	if workspace != "" {
+		fmt.Printf("Workspace: %s\n\n", workspace)
+	}
+
+	cmd := exec.Command(program, args...)
+	if workspace != "" {
+		cmd.Dir = workspace
+	}
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func claudeCommand(prompt string) (string, []string) {
+	return "claude", []string{"--dangerously-skip-permissions", prompt}
+}
+
+func claudePrintCommand(prompt string) (string, []string) {
+	return "claude", []string{"-p", "--dangerously-skip-permissions", "--output-format", "text", prompt}
+}
+
+func claudeCommandForUI(prompt, workspace, ui string) (string, []string) {
+	_ = workspace
+	if effectiveClaudeUI(ui) == "print" {
+		return claudePrintCommand(prompt)
+	}
+	return claudeCommand(prompt)
+}
+
 func (m *Manager) buildPlist(label string, argv []string, record JobRecord, calendarEntries []map[string]int) map[string]any {
 	payload := map[string]any{
 		"Label":                label,
@@ -2142,6 +2584,19 @@ func buildCodexPrompt(prompt string, recurring bool, workspaceRoot bool) string 
 	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + strings.TrimSpace(prompt)
 }
 
+func buildClaudePrompt(prompt string, recurring bool, workspaceRoot bool) string {
+	parts := []string{scheduledClaudePromptIntro}
+	if workspaceRoot {
+		parts = append(parts, workspaceCodexPromptPrefix)
+	}
+	if workspaceRoot && recurring {
+		parts = append(parts, recurringCodexPromptPrefix)
+	}
+	parts = append(parts, scheduledCodexLocalToolPrefix)
+	parts = append(parts, scheduledCodexChatHandoff)
+	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + strings.TrimSpace(prompt)
+}
+
 func extractTaskPrompt(prompt string) string {
 	marker := "\n\nTask:\n"
 	if idx := strings.Index(prompt, marker); idx >= 0 {
@@ -2328,6 +2783,7 @@ func (f *stringListFlag) Set(value string) error {
 func scheduleValueFlags() map[string]bool {
 	return map[string]bool{
 		"prompt":    true,
+		"provider":  true,
 		"project":   true,
 		"workspace": true,
 		"daily":     true,
@@ -2345,6 +2801,7 @@ func scheduleValueFlags() map[string]bool {
 		"stderr":    true,
 		"weekday":   true,
 		"env":       true,
+		"type":      true,
 		"ui":        true,
 	}
 }
@@ -2687,7 +3144,7 @@ func addPassthroughToolEnv(env map[string]string) {
 
 func (m *Manager) runtimeEnvForJob(job JobRecord, triggerKind, runDir, scheduledTime string) map[string]string {
 	env := runtimeEnv(job.Name, triggerKind, runDir, scheduledTime)
-	if job.Config.Kind == "once" && !job.WorkspaceBootstrap {
+	if job.Type == "codex" && job.Config.Kind == "once" && !job.WorkspaceBootstrap {
 		env["DECLAW_CODEX_STATELESS"] = "1"
 	}
 	return env
@@ -2772,6 +3229,27 @@ func (m *Manager) codexLaunchCommand(prompt, workspace, jobName, ui string) []st
 		args[len(args)-1] = "<prompt from file>"
 	}
 	return append([]string{program}, args...)
+}
+
+func (m *Manager) claudeLaunchCommand(prompt, workspace, jobName, ui string) []string {
+	program, args := claudeCommandForUI(prompt, workspace, ui)
+	_ = jobName
+	if len(args) > 0 {
+		args = append([]string(nil), args...)
+		args[len(args)-1] = "<prompt from file>"
+	}
+	return append([]string{program}, args...)
+}
+
+func (m *Manager) agentLaunchCommand(jobType, prompt, workspace, jobName, ui string) []string {
+	switch jobType {
+	case "codex":
+		return m.codexLaunchCommand(prompt, workspace, jobName, ui)
+	case "claude":
+		return m.claudeLaunchCommand(prompt, workspace, jobName, ui)
+	default:
+		return []string{jobType}
+	}
 }
 
 func upsertEnv(items []string, key, value string) []string {

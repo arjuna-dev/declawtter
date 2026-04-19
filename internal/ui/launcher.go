@@ -47,10 +47,11 @@ func ScheduleCommands() []Command {
 		{Name: "/schedule remove", Description: "Remove a scheduled job"},
 		{Name: "/schedule remove-all", Description: "Remove every installed scheduled job"},
 		{Name: "/schedule prune-once", Description: "Clean up completed one-off job records"},
-		{Name: "/schedule get-prompt", Description: "Print the stored prompt for a Codex schedule"},
+		{Name: "/schedule get-prompt", Description: "Print the stored prompt for an agent schedule"},
 		{Name: "/schedule get-time", Description: "Print the stored time for a schedule"},
 		{Name: "/schedule codex", Description: "Schedule a Codex run"},
-		{Name: "/schedule edit", Description: "Edit an existing scheduled job"},
+		{Name: "/schedule claude", Description: "Schedule a Claude Code run"},
+		{Name: "/schedule edit", Description: "Edit an existing scheduled job, including provider"},
 	}
 }
 
