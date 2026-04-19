@@ -113,6 +113,7 @@ func newLauncherModel(commands []Command) launcherModel {
 		input:    ti,
 		commands: commands,
 	}
+	model.updateInputHeight()
 	model.filtered = model.filterCommands("")
 	return model
 }
@@ -131,6 +132,7 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.commandStack = m.commandStack[:len(m.commandStack)-1]
 				m.breadcrumbs = m.breadcrumbs[:len(m.breadcrumbs)-1]
 				m.input.SetValue("")
+				m.updateInputHeight()
 				m.filtered = m.filterCommands("")
 				m.selected = 0
 				return m, nil
@@ -169,11 +171,13 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.commandStack = append(m.commandStack, m.commands)
 					m.commands = m.filtered[m.selected].Children
 					m.input.SetValue("")
+					m.updateInputHeight()
 					m.filtered = m.filterCommands("")
 					m.selected = 0
 					return m, nil
 				}
 				m.input.SetValue(m.filtered[m.selected].Name + " ")
+				m.updateInputHeight()
 				m.filtered = m.filterCommands(m.input.Value())
 				m.selected = 0
 				return m, nil
@@ -184,11 +188,13 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.commandStack = append(m.commandStack, m.commands)
 					m.commands = m.filtered[m.selected].Children
 					m.input.SetValue("")
+					m.updateInputHeight()
 					m.filtered = m.filterCommands("")
 					m.selected = 0
 					return m, nil
 				}
 				m.input.SetValue(m.filtered[m.selected].Name + " ")
+				m.updateInputHeight()
 				m.filtered = m.filterCommands(m.input.Value())
 				m.selected = 0
 				return m, nil
@@ -200,12 +206,40 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	m.updateInputHeight()
 	m.filtered = m.filterCommands(m.input.Value())
 	if m.selected >= len(m.filtered) {
 		m.selected = max(0, len(m.filtered)-1)
 	}
 	m.adjustOffset()
 	return m, cmd
+}
+
+func (m *launcherModel) updateInputHeight() {
+	m.input.SetHeight(launcherInputRows(m.input.Value(), m.input.Width()))
+}
+
+func launcherInputRows(value string, width int) int {
+	if width < 1 {
+		width = 1
+	}
+	if value == "" {
+		return 1
+	}
+
+	rows := 0
+	for _, line := range strings.Split(value, "\n") {
+		lineWidth := lipgloss.Width(line)
+		if lineWidth == 0 {
+			rows++
+			continue
+		}
+		rows += (lineWidth + width - 1) / width
+	}
+	if rows < 1 {
+		return 1
+	}
+	return rows
 }
 
 func (m *launcherModel) adjustOffset() {
