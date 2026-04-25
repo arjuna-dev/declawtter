@@ -589,7 +589,7 @@ func (m *Manager) scheduleClaude(args []string) (string, error) {
 	cwd := fs.String("cwd", "", "cwd")
 	stdout := fs.String("stdout", "", "stdout")
 	stderr := fs.String("stderr", "", "stderr")
-	ui := fs.String("ui", "claude", "scheduled Claude UI: claude or print")
+	ui := fs.String("ui", "claude", "scheduled Claude UI: claude, declaw, or print")
 	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
 	weekday := stringListFlag{}
 	env := stringListFlag{}
@@ -673,7 +673,7 @@ func (m *Manager) edit(args []string) (string, error) {
 	projectName := fs.String("project", "", "project")
 	workspace := fs.String("workspace", "", "workspace")
 	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
-	ui := fs.String("ui", "", "scheduled Codex UI: app-server, declaw, or codex")
+	ui := fs.String("ui", "", "scheduled UI")
 	daily := fs.String("daily", "", "daily")
 	timeValue := fs.String("time", "", "time")
 	weekdays := fs.String("weekdays", "", "weekdays")
@@ -935,7 +935,7 @@ Schedule flags:
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
   --provider codex|claude            For edit: switch an existing agent schedule between Codex and Claude.
   --ui app-server|declaw|codex       app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
-  --ui claude|print                  For Claude schedules: claude opens the raw Claude TUI; print runs headless with claude -p.
+  --ui claude|declaw|print           For Claude schedules: claude opens the raw Claude TUI; declaw uses declaw's chat UI; print runs headless with claude -p.
   --no-recurring-fallback
 `)
 }
@@ -1013,7 +1013,7 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
-  --ui claude|print              claude opens the raw Claude TUI; print runs headless with claude -p.
+  --ui claude|declaw|print       claude opens the raw Claude TUI; declaw uses declaw's chat UI; print runs headless with claude -p.
   --no-recurring-fallback
 `)
 }
@@ -1092,10 +1092,10 @@ func effectiveClaudeUI(value string) string {
 
 func validateClaudeUI(value string) error {
 	switch normalizeClaudeUI(value) {
-	case "claude", "print":
+	case "claude", "declaw", "print":
 		return nil
 	default:
-		return fmt.Errorf("--ui must be claude or print for Claude schedules, got %q", value)
+		return fmt.Errorf("--ui must be claude, declaw, or print for Claude schedules, got %q", value)
 	}
 }
 
@@ -1644,16 +1644,60 @@ type declawChatMessage struct {
 	Text string
 }
 
+type declawChatTurnRunner interface {
+	ProviderName() string
+	MissingPromptError() string
+	CommandName() string
+	LogFileName() string
+	RawSessionLabel() string
+	RawSessionCommand(sessionID string) string
+	RunTurn(sessionID, prompt, workspace string, extraEnv map[string]string, stderrPath string) (string, string, error)
+}
+
+type codexDeclawChatRunner struct{}
+
+func (codexDeclawChatRunner) ProviderName() string {
+	return "Codex"
+}
+
+func (codexDeclawChatRunner) MissingPromptError() string {
+	return "missing Codex prompt"
+}
+
+func (codexDeclawChatRunner) CommandName() string {
+	return "codex"
+}
+
+func (codexDeclawChatRunner) LogFileName() string {
+	return "codex-exec.err.log"
+}
+
+func (codexDeclawChatRunner) RawSessionLabel() string {
+	return "Raw Codex session"
+}
+
+func (codexDeclawChatRunner) RawSessionCommand(sessionID string) string {
+	return "codex resume " + sessionID
+}
+
+func (codexDeclawChatRunner) RunTurn(sessionID, prompt, workspace string, extraEnv map[string]string, stderrPath string) (string, string, error) {
+	return runCodexExecTurn(sessionID, prompt, workspace, extraEnv, stderrPath)
+}
+
 func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	return runDeclawProviderChat(prompt, workspace, jobName, extraEnv, codexDeclawChatRunner{})
+}
+
+func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[string]string, runner declawChatTurnRunner) error {
 	if strings.TrimSpace(prompt) == "" {
-		return errors.New("missing Codex prompt")
+		return errors.New(runner.MissingPromptError())
 	}
-	if _, err := exec.LookPath("codex"); err != nil {
-		return errors.New("codex command not found in PATH")
+	if _, err := exec.LookPath(runner.CommandName()); err != nil {
+		return fmt.Errorf("%s command not found in PATH", runner.CommandName())
 	}
-	logPath := filepath.Join(os.TempDir(), "declaw-codex-chat.err.log")
+	logPath := filepath.Join(os.TempDir(), "declaw-"+strings.ToLower(runner.ProviderName())+"-chat.err.log")
 	if runDir := envValue(extraEnv, "DECLAW_RUN_DIR"); strings.TrimSpace(runDir) != "" {
-		logPath = filepath.Join(runDir, "codex-exec.err.log")
+		logPath = filepath.Join(runDir, runner.LogFileName())
 	}
 
 	fmt.Println("declaw")
@@ -1667,15 +1711,18 @@ func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]s
 		fmt.Fprintf(os.Stderr, "warning: could not create visible chat transcript: %s\n", err)
 	}
 
-	threadID, displayMessage, err := runCodexExecTurn("", prompt, workspace, extraEnv, logPath, agentName)
+	sessionID, displayMessage, err := runner.RunTurn("", prompt, workspace, extraEnv, logPath)
 	if err != nil {
 		return err
+	}
+	if displayMessage != "" {
+		printDeclawChatMessage(agentName, displayMessage)
 	}
 	if transcriptPath != "" && displayMessage != "" {
 		_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
 	}
-	if threadID == "" {
-		return errors.New("codex exec did not return a thread id")
+	if sessionID == "" {
+		return fmt.Errorf("%s did not return a resumable session id", runner.ProviderName())
 	}
 
 	for {
@@ -1696,7 +1743,7 @@ func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]s
 			fmt.Println("bye")
 			return nil
 		case "/raw":
-			fmt.Printf("Raw Codex session: codex resume %s\n", threadID)
+			fmt.Printf("%s: %s\n", runner.RawSessionLabel(), runner.RawSessionCommand(sessionID))
 			fmt.Printf("Raw log: %s\n", logPath)
 			continue
 		case "/info":
@@ -1716,22 +1763,25 @@ func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]s
 		if transcriptPath != "" {
 			_ = appendDeclawChatMessage(transcriptPath, "User", message)
 		}
-		nextThreadID, displayMessage, err := runCodexExecTurn(threadID, message, workspace, extraEnv, logPath, agentName)
+		nextSessionID, displayMessage, err := runner.RunTurn(sessionID, message, workspace, extraEnv, logPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "follow-up failed: %s\n", err)
 			fmt.Fprintf(os.Stderr, "You can try again, or open the raw session with /raw.\n")
 			continue
 		}
+		if displayMessage != "" {
+			printDeclawChatMessage(agentName, displayMessage)
+		}
 		if transcriptPath != "" && displayMessage != "" {
 			_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
 		}
-		if nextThreadID != "" {
-			threadID = nextThreadID
+		if nextSessionID != "" {
+			sessionID = nextSessionID
 		}
 	}
 }
 
-func runCodexExecTurn(threadID, prompt, workspace string, extraEnv map[string]string, stderrPath, agentName string) (string, string, error) {
+func runCodexExecTurn(threadID, prompt, workspace string, extraEnv map[string]string, stderrPath string) (string, string, error) {
 	args := []string{"exec"}
 	if threadID != "" {
 		args = append(args, "resume", "--json", "--skip-git-repo-check")
@@ -1802,9 +1852,6 @@ func runCodexExecTurn(threadID, prompt, workspace string, extraEnv map[string]st
 		return seenThreadID, "", err
 	}
 	displayMessage := selectDeclawDisplayMessage(messages)
-	if displayMessage != "" {
-		printDeclawChatMessage(agentName, displayMessage)
-	}
 	return seenThreadID, displayMessage, nil
 }
 
@@ -2047,10 +2094,18 @@ func (m *Manager) launchAppServerCodexChat(prompt, workspace, jobName string, ex
 }
 
 func (m *Manager) launchCodexChatTerminal(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+	return m.launchAgentChatTerminal("codex", effectiveCodexUI(ui), prompt, workspace, jobName, extraEnv)
+}
+
+func (m *Manager) launchDeclawClaudeChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	return m.launchAgentChatTerminal("claude", "declaw", prompt, workspace, jobName, extraEnv)
+}
+
+func (m *Manager) launchAgentChatTerminal(provider, ui, prompt, workspace, jobName string, extraEnv map[string]string) error {
 	runDir := extraEnv["DECLAW_RUN_DIR"]
 	if strings.TrimSpace(runDir) == "" {
 		var err error
-		runDir, err = os.MkdirTemp(m.runsDir, "codex-")
+		runDir, err = os.MkdirTemp(m.runsDir, provider+"-")
 		if err != nil {
 			return err
 		}
@@ -2059,19 +2114,19 @@ func (m *Manager) launchCodexChatTerminal(prompt, workspace, jobName, ui string,
 		return err
 	}
 
-	promptPath := filepath.Join(runDir, "codex-prompt.txt")
+	promptPath := filepath.Join(runDir, provider+"-prompt.txt")
 	if err := os.WriteFile(promptPath, []byte(prompt), 0o600); err != nil {
 		return err
 	}
 
-	scriptPath := filepath.Join(runDir, "run-"+effectiveCodexUI(ui)+"-chat.command")
-	script := m.declawChatTerminalScript(promptPath, workspace, jobName, effectiveCodexUI(ui), extraEnv)
+	scriptPath := filepath.Join(runDir, "run-"+provider+"-"+ui+"-chat.command")
+	script := m.declawChatTerminalScript(provider, promptPath, workspace, jobName, ui, extraEnv)
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		return err
 	}
 
 	if jobName != "" {
-		fmt.Printf("Opening %s chat for scheduled Codex job: %s\n", effectiveCodexUI(ui), jobName)
+		fmt.Printf("Opening %s chat for scheduled %s job: %s\n", ui, providerDisplayName(provider), jobName)
 	}
 	if workspace != "" {
 		fmt.Printf("Workspace: %s\n\n", workspace)
@@ -2084,7 +2139,7 @@ func (m *Manager) launchCodexChatTerminal(prompt, workspace, jobName, ui string,
 	return cmd.Run()
 }
 
-func (m *Manager) declawChatTerminalScript(promptPath, workspace, jobName, ui string, extraEnv map[string]string) string {
+func (m *Manager) declawChatTerminalScript(provider, promptPath, workspace, jobName, ui string, extraEnv map[string]string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/zsh\n")
 	b.WriteString("set -e\n")
@@ -2104,7 +2159,9 @@ func (m *Manager) declawChatTerminalScript(promptPath, workspace, jobName, ui st
 	}
 	b.WriteString("exec ")
 	b.WriteString(shellQuote(m.executablePath))
-	b.WriteString(" schedule __internal run-codex --prompt-file ")
+	b.WriteString(" schedule __internal run-")
+	b.WriteString(provider)
+	b.WriteString(" --prompt-file ")
 	b.WriteString(shellQuote(promptPath))
 	b.WriteString(" --delete-prompt-file --job-name ")
 	b.WriteString(shellQuote(jobName))
@@ -2116,6 +2173,17 @@ func (m *Manager) declawChatTerminalScript(promptPath, workspace, jobName, ui st
 	b.WriteString(shellQuote(effectiveCodexUI(ui)))
 	b.WriteString("\n")
 	return b.String()
+}
+
+func providerDisplayName(provider string) string {
+	switch provider {
+	case "codex":
+		return "Codex"
+	case "claude":
+		return "Claude"
+	default:
+		return provider
+	}
 }
 
 func codexCommand(prompt, workspace string) (string, []string) {
@@ -2147,6 +2215,8 @@ func (m *Manager) launchClaude(prompt, workspace, jobName, ui string, extraEnv m
 	switch effectiveClaudeUI(ui) {
 	case "claude":
 		return m.launchClaudeInteractive(prompt, workspace, jobName, extraEnv)
+	case "declaw":
+		return m.launchDeclawClaudeChat(prompt, workspace, jobName, extraEnv)
 	case "print":
 		return runClaudePrint(prompt, workspace, jobName, extraEnv)
 	default:
@@ -2236,11 +2306,47 @@ func runClaudeWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]
 	switch effectiveClaudeUI(ui) {
 	case "claude":
 		return runClaudeDirect(prompt, workspace, jobName, extraEnv)
+	case "declaw":
+		return runDeclawClaudeChat(prompt, workspace, jobName, extraEnv)
 	case "print":
 		return runClaudePrint(prompt, workspace, jobName, extraEnv)
 	default:
 		return fmt.Errorf("unknown Claude UI %q", ui)
 	}
+}
+
+type claudeDeclawChatRunner struct{}
+
+func (claudeDeclawChatRunner) ProviderName() string {
+	return "Claude"
+}
+
+func (claudeDeclawChatRunner) MissingPromptError() string {
+	return "missing Claude prompt"
+}
+
+func (claudeDeclawChatRunner) CommandName() string {
+	return "claude"
+}
+
+func (claudeDeclawChatRunner) LogFileName() string {
+	return "claude-print.err.log"
+}
+
+func (claudeDeclawChatRunner) RawSessionLabel() string {
+	return "Raw Claude session"
+}
+
+func (claudeDeclawChatRunner) RawSessionCommand(sessionID string) string {
+	return "claude --resume " + sessionID
+}
+
+func (claudeDeclawChatRunner) RunTurn(sessionID, prompt, workspace string, extraEnv map[string]string, stderrPath string) (string, string, error) {
+	return runClaudePrintTurn(sessionID, prompt, workspace, extraEnv, stderrPath)
+}
+
+func runDeclawClaudeChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
+	return runDeclawProviderChat(prompt, workspace, jobName, extraEnv, claudeDeclawChatRunner{})
 }
 
 func runClaudeDirect(prompt, workspace, jobName string, extraEnv map[string]string) error {
@@ -2278,7 +2384,6 @@ func runClaudePrint(prompt, workspace, jobName string, extraEnv map[string]strin
 		return errors.New("claude command not found in PATH")
 	}
 
-	program, args := claudePrintCommand(prompt)
 	if jobName != "" {
 		fmt.Printf("Launching scheduled Claude print job: %s\n", jobName)
 	}
@@ -2286,14 +2391,177 @@ func runClaudePrint(prompt, workspace, jobName string, extraEnv map[string]strin
 		fmt.Printf("Workspace: %s\n\n", workspace)
 	}
 
-	cmd := exec.Command(program, args...)
+	stderrPath := filepath.Join(os.TempDir(), "declaw-claude-print.err.log")
+	if runDir := envValue(extraEnv, "DECLAW_RUN_DIR"); strings.TrimSpace(runDir) != "" {
+		stderrPath = filepath.Join(runDir, "claude-print.err.log")
+	}
+
+	transcriptPath, err := startDeclawPrintTranscript(workspace, jobName, prompt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create print session transcript: %s\n", err)
+	}
+
+	sessionID, displayMessage, err := runClaudePrintTurn("", prompt, workspace, extraEnv, stderrPath)
+	if err != nil {
+		return err
+	}
+	if displayMessage != "" {
+		fmt.Println(displayMessage)
+	}
+	if transcriptPath != "" {
+		if displayMessage != "" {
+			_ = appendDeclawChatMessage(transcriptPath, declawAgentName(workspace), displayMessage)
+		}
+		if sessionID != "" {
+			_ = appendLines(transcriptPath, fmt.Sprintf("- Claude session id: `%s`", sessionID), "")
+		}
+	}
+	return nil
+}
+
+func startDeclawPrintTranscript(workspace, jobName, prompt string) (string, error) {
+	if strings.TrimSpace(workspace) == "" {
+		return "", nil
+	}
+	sessionsDir := filepath.Join(workspace, "SESSIONS")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		return "", err
+	}
+	now := time.Now().In(time.Local)
+	name := now.Format("2006-01-02T15-04-05") + "-declaw-print.md"
+	path := filepath.Join(sessionsDir, name)
+	title := "# Declaw Print Run " + now.Format("2006-01-02 15:04:05 MST")
+	parts := []string{title, ""}
+	if strings.TrimSpace(jobName) != "" {
+		parts = append(parts, fmt.Sprintf("- Job: `%s`", jobName))
+	}
+	parts = append(parts, fmt.Sprintf("- Workspace: `%s`", workspace), "- UI: `print`", "")
+	if task := extractTaskPrompt(prompt); task != "" {
+		parts = append(parts, "## User", "", task, "")
+	}
+	return path, os.WriteFile(path, []byte(strings.Join(parts, "\n")), 0o644)
+}
+
+func runClaudePrintTurn(sessionID, prompt, workspace string, extraEnv map[string]string, stderrPath string) (string, string, error) {
+	args := []string{"-p", "--dangerously-skip-permissions", "--output-format", "stream-json"}
+	if sessionID != "" {
+		args = append(args, "--resume", sessionID)
+	}
+	args = append(args, prompt)
+
+	cmd := exec.Command("claude", args...)
 	if workspace != "" {
 		cmd.Dir = workspace
 	}
 	cmd.Env = mergeEnv(os.Environ(), extraEnv)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	stderrFile, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return "", "", err
+	}
+	defer stderrFile.Close()
+	cmd.Stderr = stderrFile
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", "", err
+	}
+
+	seenSessionID := sessionID
+	messages := []string{}
+	showSpinner := stdoutIsTerminal()
+	done := make(chan struct{})
+	if showSpinner {
+		go runDeclawSpinner(done)
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		nextSessionID, message := parseClaudeStreamJSONLine(scanner.Bytes())
+		if nextSessionID != "" {
+			seenSessionID = nextSessionID
+		}
+		if message != "" {
+			messages = append(messages, message)
+		}
+	}
+	if showSpinner {
+		close(done)
+		clearDeclawSpinner()
+	}
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Wait()
+		return seenSessionID, "", err
+	}
+	if err := cmd.Wait(); err != nil {
+		return seenSessionID, "", err
+	}
+	return seenSessionID, selectDeclawDisplayMessage(messages), nil
+}
+
+func parseClaudeStreamJSONLine(line []byte) (string, string) {
+	var event struct {
+		Type      string          `json:"type"`
+		Subtype   string          `json:"subtype"`
+		SessionID string          `json:"session_id"`
+		Result    string          `json:"result"`
+		Text      string          `json:"text"`
+		Message   json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(line, &event); err != nil {
+		return "", ""
+	}
+	sessionID := strings.TrimSpace(event.SessionID)
+	switch event.Type {
+	case "result":
+		return sessionID, strings.TrimSpace(event.Result)
+	case "assistant":
+		return sessionID, strings.TrimSpace(extractClaudeMessageText(event.Message))
+	default:
+		if event.Text != "" {
+			return sessionID, strings.TrimSpace(event.Text)
+		}
+		return sessionID, ""
+	}
+}
+
+func extractClaudeMessageText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var message struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &message); err != nil {
+		return ""
+	}
+	return extractClaudeContentText(message.Content)
+}
+
+func extractClaudeContentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	values := []string{}
+	for _, part := range parts {
+		if (part.Type == "" || part.Type == "text") && strings.TrimSpace(part.Text) != "" {
+			values = append(values, strings.TrimSpace(part.Text))
+		}
+	}
+	return strings.Join(values, "\n\n")
 }
 
 func claudeCommand(prompt string) (string, []string) {
@@ -2301,15 +2569,19 @@ func claudeCommand(prompt string) (string, []string) {
 }
 
 func claudePrintCommand(prompt string) (string, []string) {
-	return "claude", []string{"-p", "--dangerously-skip-permissions", "--output-format", "text", prompt}
+	return "claude", []string{"-p", "--dangerously-skip-permissions", "--output-format", "stream-json", prompt}
 }
 
 func claudeCommandForUI(prompt, workspace, ui string) (string, []string) {
 	_ = workspace
-	if effectiveClaudeUI(ui) == "print" {
+	switch effectiveClaudeUI(ui) {
+	case "declaw":
+		return "claude", []string{"-p", "--dangerously-skip-permissions", "--output-format", "stream-json", prompt}
+	case "print":
 		return claudePrintCommand(prompt)
+	default:
+		return claudeCommand(prompt)
 	}
-	return claudeCommand(prompt)
 }
 
 func (m *Manager) buildPlist(label string, argv []string, record JobRecord, calendarEntries []map[string]int) map[string]any {

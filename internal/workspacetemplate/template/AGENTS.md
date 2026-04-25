@@ -57,13 +57,13 @@ When the user wants to schedule future work:
 - if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
 - for one-off agent schedules only, `--workspace <path>` or no target is allowed
 - scheduled Codex jobs use declaw's app-server chat UI by default; use `--ui declaw` for the legacy `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted
-- scheduled Claude jobs use the raw Claude TUI by default; use `--ui print` for headless `claude -p` runs
+- scheduled Claude jobs use the raw Claude TUI by default; use `--ui declaw` for declaw's chat UI, and `--ui print` for headless `claude -p` runs
 - only schedule future work when an agent should run
 - only avoid scheduling when the user clearly does not want a scheduled action
 
 ## Declaw CLI
 
-`declaw` is the primary local tool for this workspace. Use it whenever the user wants to manage assistant workspaces, open a Codex session in a tracked project, or schedule future agent work.
+`declaw` is the primary local tool for this workspace. Use it whenever the user wants to manage assistant workspaces, open a configured-agent session in a tracked project, or schedule future agent work.
 
 Core commands:
 
@@ -73,13 +73,15 @@ declaw create <name> --into <parent-dir>
 declaw track <name> --path <existing-dir>
 declaw path <name>
 declaw checkout <name>
+declaw settings provider codex
+declaw settings provider claude
 declaw ai-agent "<task>"
 declaw schedule list
 declaw schedule codex <job> --project <name> --daily HH:MM --prompt "<task>"
 declaw schedule claude <job> --project <name> --daily HH:MM --prompt "<task>"
 ```
 
-Use `declaw schedule codex ...` or `declaw schedule claude ...` when the user wants future agent work to run by itself. Use `declaw checkout <project>` when the user wants to chat in an existing tracked project context now.
+Use `declaw schedule codex ...` or `declaw schedule claude ...` when the user wants future agent work to run by itself. Use `declaw checkout <project>` when the user wants to chat in an existing tracked project context now; it follows `declaw settings provider`.
 
 ## Handoff After Bootstrap
 

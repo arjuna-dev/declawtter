@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,12 +11,14 @@ import (
 	"declaw/internal/agentworkspace"
 	"declaw/internal/projects"
 	"declaw/internal/scheduler"
+	"declaw/internal/settings"
 	"declaw/internal/ui"
 )
 
 type App struct {
 	projects *projects.Manager
 	schedule *scheduler.Manager
+	settings *settings.Manager
 }
 
 func New() (*App, error) {
@@ -28,10 +31,15 @@ func New() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	settingsManager, err := settings.NewManager()
+	if err != nil {
+		return nil, err
+	}
 
 	return &App{
 		projects: projectManager,
 		schedule: scheduleManager,
+		settings: settingsManager,
 	}, nil
 }
 
@@ -66,15 +74,10 @@ func (a *App) runInteractive() int {
 			return 1
 		}
 		line := strings.TrimSpace(result.Line)
-		fields, err := parseCommandLine(line)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		if result.Exit || len(fields) == 0 || strings.EqualFold(line, "/exit") {
+		if result.Exit || line == "" || strings.EqualFold(line, "/exit") {
 			return 0
 		}
-		if !strings.HasPrefix(fields[0], "/") {
+		if !strings.HasPrefix(line, "/") {
 			output, err := a.aiAgent([]string{line})
 			if output != "" {
 				fmt.Fprintln(os.Stdout, output)
@@ -83,6 +86,14 @@ func (a *App) runInteractive() int {
 				fmt.Fprintln(os.Stderr, err)
 				return 1
 			}
+			return 0
+		}
+		fields, err := parseCommandLine(line)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if len(fields) == 0 {
 			return 0
 		}
 		fields[0] = strings.TrimPrefix(fields[0], "/")
@@ -192,6 +203,8 @@ func (a *App) execute(args []string) (string, error) {
 		return a.checkout(args[1:])
 	case "ai-agent":
 		return a.aiAgent(args[1:])
+	case "settings", "config":
+		return a.settingsCommand(args[1:])
 	case "list":
 		return a.projects.List(args[1:])
 	case "path":
@@ -207,7 +220,7 @@ func (a *App) execute(args []string) (string, error) {
 
 func (a *App) aiAgent(args []string) (string, error) {
 	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
-		return "usage: declaw ai-agent [prompt]\n\nOpen Codex in declaw's embedded management-agent workspace. If prompt is provided, it is passed to Codex as the starting task.", nil
+		return "usage: declaw ai-agent [prompt]\n\nOpen the configured agent provider in declaw's embedded management-agent workspace. If prompt is provided, it is passed to the agent as the starting task.", nil
 	}
 	workspace, err := declawAgentWorkspace()
 	if err != nil {
@@ -216,16 +229,20 @@ func (a *App) aiAgent(args []string) (string, error) {
 	if err := agentworkspace.Ensure(workspace); err != nil {
 		return "", err
 	}
-	if _, err := exec.LookPath("codex"); err != nil {
-		return "", fmt.Errorf("codex command not found in PATH")
+	provider, err := a.settings.DefaultProvider()
+	if err != nil {
+		return "", err
 	}
 
-	cmdArgs := []string{}
 	prompt := strings.TrimSpace(strings.Join(args, " "))
-	if prompt != "" {
-		cmdArgs = append(cmdArgs, prompt)
+	program, cmdArgs, err := agentCommand(provider, prompt)
+	if err != nil {
+		return "", err
 	}
-	cmd := exec.Command("codex", cmdArgs...)
+	if _, err := exec.LookPath(program); err != nil {
+		return "", fmt.Errorf("%s command not found in PATH", program)
+	}
+	cmd := exec.Command(program, cmdArgs...)
 	cmd.Dir = workspace
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -240,6 +257,40 @@ func declawAgentWorkspace() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dataDir, "declaw", "ai-agent"), nil
+}
+
+func (a *App) settingsCommand(args []string) (string, error) {
+	if len(args) == 0 {
+		provider, err := a.settings.DefaultProvider()
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("default provider: %s\nsettings: %s", provider, a.settings.Path()), nil
+	}
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
+		return "usage: declaw settings provider [codex|claude]\n\nChoose which agent provider declaw uses for free-text launcher input, checkout, and ai-agent.", nil
+	}
+	if args[0] != "provider" {
+		return "", fmt.Errorf("unknown settings key %q\n\nusage: declaw settings provider [codex|claude]", args[0])
+	}
+	if len(args) == 1 {
+		provider, err := a.settings.DefaultProvider()
+		if err != nil {
+			return "", err
+		}
+		return provider, nil
+	}
+	if len(args) != 2 {
+		return "", errors.New("usage: declaw settings provider [codex|claude]")
+	}
+	if err := a.settings.SetDefaultProvider(args[1]); err != nil {
+		return "", err
+	}
+	provider, err := a.settings.DefaultProvider()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("default provider: %s", provider), nil
 }
 
 func (a *App) interactiveCommands() ([]ui.Command, error) {
@@ -361,17 +412,47 @@ func (a *App) checkout(args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := exec.LookPath("codex"); err != nil {
-		return "", fmt.Errorf("codex command not found in PATH")
+	provider, err := a.settings.DefaultProvider()
+	if err != nil {
+		return "", err
+	}
+	program, cmdArgs, err := agentCommand(provider, "")
+	if err != nil {
+		return "", err
+	}
+	if _, err := exec.LookPath(program); err != nil {
+		return "", fmt.Errorf("%s command not found in PATH", program)
 	}
 
-	cmd := exec.Command("codex")
+	cmd := exec.Command(program, cmdArgs...)
 	cmd.Dir = project.Path
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 	return "", cmd.Run()
+}
+
+func agentCommand(provider, prompt string) (string, []string, error) {
+	if err := settings.ValidateProvider(provider); err != nil {
+		return "", nil, err
+	}
+	prompt = strings.TrimSpace(prompt)
+	switch strings.TrimSpace(strings.ToLower(provider)) {
+	case "codex":
+		if prompt == "" {
+			return "codex", nil, nil
+		}
+		return "codex", []string{prompt}, nil
+	case "claude":
+		args := []string{"--dangerously-skip-permissions"}
+		if prompt != "" {
+			args = append(args, prompt)
+		}
+		return "claude", args, nil
+	default:
+		return "", nil, fmt.Errorf("provider must be codex or claude, got %q", provider)
+	}
 }
 
 func (a *App) help() string {
@@ -383,6 +464,7 @@ Commands:
   track <name> --path <dir>
   checkout <name>
   ai-agent [prompt]
+  settings provider [codex|claude]
   list
   path <name>
   remove <name>
@@ -414,8 +496,12 @@ Schedule flags:
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
   --provider codex|claude        For edit: switch an existing agent schedule between Codex and Claude.
   --ui app-server|declaw|codex   app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
-  --ui claude|print              For Claude schedules: claude opens the raw Claude TUI; print runs headless with claude -p.
+  --ui claude|declaw|print       For Claude schedules: claude opens the raw Claude TUI; declaw uses declaw's chat UI; print runs headless with claude -p.
   --no-recurring-fallback
+
+Settings:
+  declaw settings provider codex      Use Codex for free-text launcher input, checkout, and ai-agent.
+  declaw settings provider claude     Use Claude Code for free-text launcher input, checkout, and ai-agent.
 
 Scheduled chat follow-ups:
   Enter sends. Ctrl+J inserts a line break. Long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
@@ -430,6 +516,7 @@ Agent workflow:
 Examples:
   declaw create pm-workspace --into ~/Documents/dev
   declaw track product-repo --path ~/Documents/dev/my-repo
+  declaw settings provider claude
   declaw checkout pm-workspace
   declaw ai-agent "Create a recurring Codex schedule for my PM review."
   declaw schedule codex pm-deadline-review --project pm-workspace --weekdays 09:00 --prompt "Review the workspace, update the relevant CLI-managed directory, inspect the codebase context, and propose PM deadline follow-ups."

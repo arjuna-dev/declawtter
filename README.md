@@ -16,6 +16,7 @@ declaw list
 declaw path my-workspace
 cd "$(declaw path my-workspace)"
 declaw checkout my-workspace
+declaw settings provider claude
 declaw ai-agent "Create a recurring Codex schedule for my PM review."
 
 declaw schedule codex morning-review --project my-workspace --daily 09:30 --prompt "Review the repo and summarize blockers."
@@ -24,7 +25,7 @@ declaw schedule list
 ```
 
 Scheduled Codex jobs use declaw's app-server chat UI by default. Pass `--ui declaw` for the legacy `codex exec` chat UI, or `--ui codex` when you want the raw Codex TUI instead.
-Scheduled Claude jobs use the raw Claude TUI by default. Pass `--ui print` for headless `claude -p` runs. Claude schedules run with `--dangerously-skip-permissions`, so only point them at directories you trust.
+Scheduled Claude jobs use the raw Claude TUI by default. Pass `--ui declaw` for declaw's chat UI, or `--ui print` for headless `claude -p` runs. Claude schedules run with `--dangerously-skip-permissions`, so only point them at directories you trust.
 
 For agent-created recurring jobs, always choose or register the project first:
 
@@ -54,6 +55,8 @@ Running `declaw` without arguments opens an interactive command launcher:
 - up and down arrows to move
 - Enter to select or run
 
+Free-text launcher input, `declaw checkout`, and `declaw ai-agent` use Codex by default. Switch the default interactive provider with `declaw settings provider claude`, or switch back with `declaw settings provider codex`.
+
 ## Generated Workspace Structure
 
 - `AGENTS.md`: bootstrap contract first, then normal workspace instructions after handoff
@@ -67,8 +70,8 @@ Running `declaw` without arguments opens an interactive command launcher:
 
 - Scheduled agent runs store the effective prompt with workspace bootstrap instructions.
 - `declaw create` copies the embedded workspace template by default. Use `--source <dir>` only as an explicit development override.
-- `declaw checkout <project>` opens interactive Codex in that project's directory. A CLI cannot change the parent shell's directory, so use `cd "$(declaw path <project>)"` when you only need shell navigation.
-- `declaw ai-agent [prompt]` opens Codex in an embedded declaw-management workspace with instructions for managing projects and Codex schedules through the CLI.
+- `declaw checkout <project>` opens the configured interactive provider in that project's directory. A CLI cannot change the parent shell's directory, so use `cd "$(declaw path <project>)"` when you only need shell navigation.
+- `declaw ai-agent [prompt]` opens the configured provider in an embedded declaw-management workspace with instructions for managing projects and schedules through the CLI.
 - Recurring agent runs require an explicit declaw project and run with that project directory as context.
 - One-off agent runs may omit a directory and use declaw's default one-off workspace.
 - Recurring schedules install an optional paired recovery job by default.

@@ -27,12 +27,21 @@ func Commands() []Command {
 	return []Command{
 		{Name: "/create", Description: "Create a new declaw project/assistant"},
 		{Name: "/track", Description: "Track an existing directory as a declaw project"},
-		{Name: "/checkout", Description: "Open Codex in a tracked project"},
+		{Name: "/checkout", Description: "Open the configured agent in a tracked project"},
+		{Name: "/settings", Description: "Show or change declaw settings", Children: SettingsCommands()},
 		{Name: "/list", Description: "List tracked projects"},
 		{Name: "/path", Description: "Print a tracked project path"},
 		{Name: "/remove", Description: "Remove a tracked project"},
 		{Name: "/schedule", Description: "Schedule commands and installed jobs", Children: ScheduleCommands()},
 		{Name: "/exit", Description: "Exit declaw"},
+	}
+}
+
+func SettingsCommands() []Command {
+	return []Command{
+		{Name: "/settings provider", Description: "Print the configured agent provider"},
+		{Name: "/settings provider codex", Description: "Use Codex for launcher input and checkout"},
+		{Name: "/settings provider claude", Description: "Use Claude Code for launcher input and checkout"},
 	}
 }
 
