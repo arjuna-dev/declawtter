@@ -1978,7 +1978,20 @@ func declawAgentName(workspace string) string {
 	if strings.TrimSpace(workspace) == "" {
 		return "Declaw"
 	}
-	data, err := os.ReadFile(filepath.Join(workspace, "WORKSPACE", "IDENTITY.md"))
+	data, err := os.ReadFile(filepath.Join(workspace, "AGENTS.md"))
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "- Name:") {
+				continue
+			}
+			name := strings.TrimSpace(strings.TrimPrefix(trimmed, "- Name:"))
+			if name != "" && !strings.HasPrefix(name, "[Replace this line") {
+				return name
+			}
+		}
+	}
+	data, err = os.ReadFile(filepath.Join(workspace, "WORKSPACE", "IDENTITY.md"))
 	if err != nil {
 		return "Declaw"
 	}

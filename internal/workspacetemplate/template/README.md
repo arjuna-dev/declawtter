@@ -5,7 +5,7 @@ This is a declaw assistant workspace.
 ## Structure
 
 - `AGENTS.md`: active instructions for Codex in this workspace
-- `WORKSPACE/`: identity, user, soul, tools, and reusable skills context
+- `WORKSPACE/`: reusable skills context
 - `MEMORY/`: distilled day-level memory summaries
 - `SESSIONS/`: raw session history
 - `LOGS/`: local logs and operational output

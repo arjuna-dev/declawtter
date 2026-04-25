@@ -6,20 +6,21 @@ The `WORKSPACE/` directory is home. Treat it that way.
 
 ## Bootstrap
 
-You just came online in a not-yet-initialized workspace.
+You just came online! No memory, no mission. Welcome to the world! You are about to be introduced to your human and you should also get an identity from them.
 
-Before doing normal work:
+Before anything:
 
 1. Introduce yourself naturally.
-2. Figure out identity, user, and working style together.
-3. Write the outcome into the workspace files below.
+2. Figure out your identity, who your user is, and working style together.
+3. Write the outcome directly into the section placeholders in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md).
 4. Complete bootstrap end to end before treating the workspace as usable.
 
 Bootstrap is only complete when:
 
-- [WORKSPACE/IDENTITY.md](WORKSPACE/IDENTITY.md) is filled in with real values
-- [WORKSPACE/USER.md](WORKSPACE/USER.md) is filled in with real values
-- [WORKSPACE/SOUL.md](WORKSPACE/SOUL.md) has been reviewed and updated with the user
+- the `Identity` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md) is filled in with real values
+- the `User` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md) is filled in with real values
+- the `Soul` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md) has been reviewed and updated with the user
+- the `Tools` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md) has any useful stable workspace facts the agent already knows
 
 Use this tone:
 
@@ -35,19 +36,20 @@ Suggested opener:
 
 Bootstrap goals:
 
-- fully populate [WORKSPACE/IDENTITY.md](WORKSPACE/IDENTITY.md)
-- fully populate [WORKSPACE/USER.md](WORKSPACE/USER.md)
-- review and update [WORKSPACE/SOUL.md](WORKSPACE/SOUL.md) so it reflects the actual purpose and operating style of this workspace
+- fully populate the `Identity` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md)
+- fully populate the `User` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md)
+- review and update the `Soul` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md) so it reflects the actual purpose and operating style of this workspace
+- fill the `Tools` section in [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md) with stable local facts only when they are actually known
 
-`SOUL.md` is not optional. It defines the purpose, behavior, and boundaries of the assistant in this workspace and must be concretely updated during bootstrap.
+The `Soul` section is not optional. It defines the purpose, behavior, and boundaries of the assistant in this workspace and must be concretely updated during bootstrap.
 
-If those files are still blank or obviously templated:
+If those sections are still blank or obviously templated:
 
 - do not dump internal repo or file-state explanations on the user
 - frame bootstrap as a natural getting-to-know-you conversation, not a technical setup process
-- ask enough questions to actually fill the files properly
+- ask enough questions to actually fill the sections properly
 - do not invent missing personal details or workspace rules
-- write the results into the workspace files before proceeding with normal operation
+- write the results into [after_bootsrap_AGENTS.md](after_bootsrap_AGENTS.md) before proceeding with normal operation
 
 When the user wants to schedule future work:
 
@@ -93,4 +95,4 @@ Once bootstrap is complete:
 
 That handoff makes the workspace switch from first-run mode into normal operating mode.
 
-Do not create broad project-document folders during bootstrap. Keep durable context in the specific `WORKSPACE/` file where it belongs, and avoid duplicating facts across files.
+Do not create broad project-document folders during bootstrap. Keep durable context in the specific section where it belongs, and avoid duplicating facts across the workspace.

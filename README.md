@@ -59,9 +59,9 @@ Free-text launcher input, `declaw checkout`, and `declaw ai-agent` use Codex by 
 
 ## Generated Workspace Structure
 
-- `AGENTS.md`: bootstrap contract first, then normal workspace instructions after handoff
-- `after_bootsrap_AGENTS.md`: normal workspace instructions used during bootstrap handoff
-- `WORKSPACE/`: identity, user, soul, tools, and skills context
+- `AGENTS.md`: bootstrap contract first, then the single source of identity, user, soul, and tools instructions after handoff
+- `after_bootsrap_AGENTS.md`: normal workspace instructions template that bootstrap fills in, then renames to `AGENTS.md`
+- `WORKSPACE/`: reusable skills context
 - `MEMORY/`: distilled day-level memory summaries
 - `SESSIONS/`: raw session history
 - `PROJECT_DOCUMENTS/`: durable project artifacts
