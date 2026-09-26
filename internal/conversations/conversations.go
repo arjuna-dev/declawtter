@@ -250,6 +250,27 @@ func LooksLikePreamble(text string) bool {
 	return false
 }
 
+// requestMarkers are headings harnesses emit immediately before the user's own
+// words when they prepend attachment lists or ambient state.
+var requestMarkers = []string{
+	"## My request:",
+	"# My request:",
+	"## User request:",
+}
+
+// lastIndexFold returns the position of the last case-insensitive occurrence of
+// any marker, or -1. The last one wins because these blocks can nest.
+func lastIndexFold(text string, markers []string) int {
+	lowered := strings.ToLower(text)
+	best := -1
+	for _, marker := range markers {
+		if index := strings.LastIndex(lowered, strings.ToLower(marker)); index > best {
+			best = index
+		}
+	}
+	return best
+}
+
 // userVisibleText removes injected preamble blocks so a title reflects the
 // user's actual words rather than harness scaffolding.
 func userVisibleText(raw string) string {
@@ -268,6 +289,17 @@ func userVisibleText(raw string) string {
 				break
 			}
 			text = text[:start] + text[start+end+len(closing):]
+		}
+	}
+	// Some harnesses wrap the real request in a markdown preamble (attached
+	// file lists, ambient state) and mark the user's own words with a heading.
+	// When that marker is present, everything before it is scaffolding.
+	if index := lastIndexFold(text, requestMarkers); index >= 0 {
+		text = text[index:]
+		if newline := strings.Index(text, "\n"); newline >= 0 {
+			text = text[newline+1:]
+		} else {
+			text = ""
 		}
 	}
 	// A leading standalone tag with no close leaves stray angle content; trim

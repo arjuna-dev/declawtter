@@ -302,6 +302,8 @@ func (a *App) execute(args []string) (string, error) {
 		return a.checkout(args[1:])
 	case "project-settings":
 		return a.projects.Settings(args[1:])
+	case "chat-settings":
+		return a.chatSettings(args[1:])
 	case "project":
 		return a.projectCommand(args[1:])
 	case "ai-agent":
@@ -602,10 +604,29 @@ func (a *App) interactiveCommands() ([]ui.Command, error) {
 			if err != nil {
 				return nil, err
 			}
-			commands[idx].Children = checkoutCommandChildren(recentProjects, defaultHarness)
-			if len(recentProjects) == 0 {
-				commands[idx].Description = "No discovered projects"
+			// The launcher offers the two checkout modes as submenus. Chat
+			// discovery reads several on-disk stores, so a failure there must
+			// degrade to an empty chat list rather than break the launcher.
+			chatChildren, chatErr := a.checkoutChatCommandChildren()
+			projectChild := ui.Command{
+				Name:        "/checkout project",
+				Description: "Open a recent project with its last used harness",
+				Children:    checkoutCommandChildren(recentProjects, defaultHarness),
 			}
+			if len(recentProjects) == 0 {
+				projectChild.Description = "No discovered projects"
+			}
+			chatChild := ui.Command{
+				Name:        "/checkout chat",
+				Description: "Resume a recent conversation, optionally in another harness",
+				Children:    chatChildren,
+			}
+			if chatErr != nil {
+				chatChild.Description = "Conversations unavailable: " + chatErr.Error()
+			} else if len(chatChildren) == 0 {
+				chatChild.Description = "No discovered conversations"
+			}
+			commands[idx].Children = []ui.Command{projectChild, chatChild}
 		case "/project-settings":
 			defaultHarness, err := a.settings.DefaultHarness()
 			if err != nil {
@@ -614,6 +635,16 @@ func (a *App) interactiveCommands() ([]ui.Command, error) {
 			commands[idx].Children = projectSettingsCommandChildren(projectSettingsProjects, defaultHarness)
 			if len(projectSettingsProjects) == 0 {
 				commands[idx].Description = "No discovered projects"
+			}
+		case "/chat-settings":
+			chatSettingsChildren, err := a.chatSettingsCommandChildren()
+			if err != nil {
+				commands[idx].Description = "Conversations unavailable: " + err.Error()
+				break
+			}
+			commands[idx].Children = chatSettingsChildren
+			if len(chatSettingsChildren) == 0 {
+				commands[idx].Description = "No discovered conversations"
 			}
 		case "/schedule":
 			commands[idx].Children = scheduleChildren
@@ -678,8 +709,8 @@ func checkoutCommandChildren(projectList []projects.Project, fallback string) []
 		if !project.LastActivityAt.IsZero() {
 			lastUsed = project.LastActivityAt.Local().Format("2006-01-02 15:04") + " via " + displayHarness(harness)
 		}
-		displayPrefix := "/checkout " + project.DisplayName()
-		commandPrefix := "/checkout " + project.Name
+		displayPrefix := "/checkout project " + project.DisplayName()
+		commandPrefix := "/checkout project " + project.Name
 		children = append(children, ui.Command{
 			Name:        displayPrefix,
 			CommandLine: commandPrefix,
@@ -812,7 +843,36 @@ func scheduleJobCommandChildren(action string, jobs []ui.Command) []ui.Command {
 	return children
 }
 
+// checkout dispatches the two checkout modes. `declaw checkout project` and
+// `declaw checkout chat` are the supported forms; a bare project name is still
+// accepted as a deprecated alias so existing agent scripts keep working.
 func (a *App) checkout(args []string) (string, error) {
+	if len(args) == 0 {
+		return a.checkoutOverview()
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "project", "projects":
+		return a.checkoutProject(args[1:])
+	case "chat", "chats", "conversation", "conversations":
+		return a.checkoutChat(args[1:])
+	default:
+		// Deprecated: `declaw checkout <name>` without the `project` keyword.
+		return a.checkoutProject(args)
+	}
+}
+
+// checkoutOverview is shown for a bare `declaw checkout`, pointing at the two
+// concrete modes rather than silently defaulting to one of them.
+func (a *App) checkoutOverview() (string, error) {
+	return strings.TrimSpace(`
+usage: declaw checkout project [<name> [continue|change-harness <harness>]]
+       declaw checkout chat [<id> [continue|change-harness <harness>]]
+
+  project   Open a tracked project with its last used harness.
+  chat      Resume an individual conversation, optionally in another harness.`), nil
+}
+
+func (a *App) checkoutProject(args []string) (string, error) {
 	if len(args) == 0 {
 		if err := a.refreshActivity(); err != nil {
 			return "", err
@@ -963,6 +1023,22 @@ func agentCommand(provider, prompt, codexReasoningMode string) (string, []string
 			args = append(args, prompt)
 		}
 		return program, args, nil
+	case activity.OpenCode:
+		args := []string{"--auto"}
+		if prompt != "" {
+			args = append(args, "--prompt", prompt)
+		}
+		return "opencode", args, nil
+	case activity.Antigravity:
+		program := "agy"
+		if _, err := exec.LookPath(program); err != nil {
+			program = "antigravity"
+		}
+		args := []string{}
+		if prompt != "" {
+			args = append(args, "--prompt-interactive", prompt)
+		}
+		return program, args, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported harness %q", provider)
 	}
@@ -991,15 +1067,17 @@ declaw
 Commands:
   create <name> [--into <dir> | --path <dir>] [--harness <name>]
   track <name> --path <dir>
-  checkout [<name> [continue|change-harness <harness>]]
-  project-settings <name> harness [pi|hermes|codex|claude|inherit]
+  checkout project [<name> [continue|change-harness <harness>]]
+  checkout chat [<id> [continue|change-harness <harness>]]
+  project-settings <name> harness [pi|hermes|codex|claude|opencode|antigravity|inherit]
   project-settings <name> give alias <display name>
   project-settings <name> pin [on|off]
   project-settings <name> ignore [on|off]
   project-settings <name> path
   project-settings <name> remove
+  chat-settings [<id> [pin|ignore [on|off] | alias <display name>]]
   ai-agent [prompt]
-  settings harness [pi|hermes|codex|claude]
+  settings harness [pi|hermes|codex|claude|opencode|antigravity]
   settings codex-reasoning [default|no_reasoning]
   settings terminal [terminal|ghostty]
   list

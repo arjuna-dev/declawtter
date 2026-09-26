@@ -36,6 +36,7 @@ func Commands() []Command {
 		{Name: "/create", Description: "Create an empty project in the current directory"},
 		{Name: "/track", Description: "Track the current directory after confirmation"},
 		{Name: "/project-settings", Description: "Manage per-project settings"},
+		{Name: "/chat-settings", Description: "Pin, ignore or rename conversations"},
 		{Name: "/settings", Description: "Show or change declaw settings", Children: SettingsCommands()},
 		{Name: "/list", Description: "List tracked projects"},
 		{Name: "/exit", Description: "Exit declaw"},

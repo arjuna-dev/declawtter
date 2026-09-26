@@ -152,6 +152,18 @@ func TestLocalCLIRegressionSuite(t *testing.T) {
 		return stdout
 	}
 
+	// assertErr covers commands expected to fail, checking the stderr message.
+	assertErr := func(args []string, wantCode int, stderrContains string) {
+		t.Helper()
+		code, stdout, stderr := h.run(t, args...)
+		if code != wantCode {
+			t.Fatalf("%v exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", args, code, wantCode, stdout, stderr)
+		}
+		if !strings.Contains(stderr, stderrContains) {
+			t.Fatalf("%v stderr = %q, want substring %q", args, stderr, stderrContains)
+		}
+	}
+
 	assert([]string{"help"}, 0, "Commands:", "schedule create <job>", "settings terminal [terminal|ghostty]")
 	assert([]string{"settings"}, 0, "default provider: codex", "default codex ui: codex", "default claude ui: claude", "default terminal: terminal")
 	assert([]string{"settings", "codex-ui", "codex"}, 0, "default codex ui: codex")
@@ -171,7 +183,11 @@ func TestLocalCLIRegressionSuite(t *testing.T) {
 	assert([]string{"project-settings", "demo", "provider", "codex"}, 0, "project demo provider: codex")
 	assert([]string{"project-settings", "demo", "pin", "on"}, 0, "project demo pinned: yes")
 	assert([]string{"project-settings", "demo", "ignore", "on"}, 0, "project demo ignored: yes")
-	assert([]string{"checkout"}, 0, "no available projects")
+	assert([]string{"checkout"}, 0, "declaw checkout chat")
+	assert([]string{"checkout", "project"}, 0, "no available projects")
+	// The bare `checkout <name>` form is deprecated but must keep working for
+	// existing agent scripts.
+	assertErr([]string{"checkout", "demo"}, 1, "project demo is ignored")
 	assert([]string{"project-settings", "demo", "ignore", "off"}, 0, "project demo ignored: no")
 	assert([]string{"project", "settings", "demo", "codex-ui", "codex"}, 0, "project demo codex-ui: codex")
 	assert([]string{"project", "settings", "demo", "claude-ui", "claude"}, 0, "project demo claude-ui: claude")
