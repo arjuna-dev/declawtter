@@ -16,6 +16,10 @@ func defaultSources() []Source {
 		newSQLiteSource(Codex),
 		newFilesystemSource(Claude),
 		newSQLiteSource(Claude),
+		newFilesystemSource(OpenCode),
+		newSQLiteSource(OpenCode),
+		newFilesystemSource(Antigravity),
+		newSQLiteSource(Antigravity),
 	}
 }
 
@@ -126,6 +130,26 @@ func knownDataLocations(harness Harness) []string {
 			filepath.Join(applicationSupport, "com.anthropic.claude", "Default", "Sessions"),
 			filepath.Join(applicationSupport, "com.anthropic.claude.desktop", "Default", "Sessions"),
 			filepath.Join(applicationSupport, "Claude Code", "projects"),
+		)
+	case OpenCode:
+		addEnv("DECLAW_OPENCODE_HOME", "OPENCODE_HOME", "OPENCODE_CONFIG_DIR", "OPENCODE_DATA_DIR")
+		add(
+			filepath.Join(dataHome, "opencode", "opencode.db"),
+			filepath.Join(dataHome, "opencode", "storage"),
+			filepath.Join(home, ".opencode", "opencode.db"),
+			filepath.Join(configHome, "opencode"),
+			filepath.Join(applicationSupport, "opencode"),
+		)
+	case Antigravity:
+		addEnv("DECLAW_ANTIGRAVITY_HOME", "ANTIGRAVITY_HOME", "ANTIGRAVITY_CONFIG_DIR", "GEMINI_HOME")
+		antigravityCLI := filepath.Join(home, ".gemini", "antigravity-cli")
+		add(
+			filepath.Join(antigravityCLI, "conversation_summaries.db"),
+			filepath.Join(antigravityCLI, "conversations"),
+			filepath.Join(antigravityCLI, "cache", "conversation_metadata.json"),
+			filepath.Join(antigravityCLI, "history.jsonl"),
+			filepath.Join(home, ".gemini", "antigravity"),
+			filepath.Join(applicationSupport, "Antigravity", "User", "globalStorage"),
 		)
 	}
 

@@ -6,6 +6,12 @@ import (
 	"strings"
 )
 
+// NormalizeDirectory exposes the shared directory canonicalization used by
+// activity adapters so other packages resolve paths identically.
+func NormalizeDirectory(value string) (string, bool) {
+	return normalizeDirectory(value)
+}
+
 func normalizeDirectory(value string) (string, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {

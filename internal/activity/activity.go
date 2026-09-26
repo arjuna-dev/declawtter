@@ -13,13 +13,24 @@ import (
 type Harness string
 
 const (
-	Pi     Harness = "pi"
-	Hermes Harness = "hermes"
-	Codex  Harness = "codex"
-	Claude Harness = "claude"
+	Pi          Harness = "pi"
+	Hermes      Harness = "hermes"
+	Codex       Harness = "codex"
+	Claude      Harness = "claude"
+	OpenCode    Harness = "opencode"
+	Antigravity Harness = "antigravity"
 )
 
-var supportedHarnesses = []Harness{Pi, Hermes, Codex, Claude}
+var supportedHarnesses = []Harness{Pi, Hermes, Codex, Claude, OpenCode, Antigravity}
+
+// harnessAliases maps user-typed spellings onto canonical harness names.
+var harnessAliases = map[string]Harness{
+	"open-code": OpenCode,
+	"open_code": OpenCode,
+	"agy":       Antigravity,
+	"anti":      Antigravity,
+	"gravity":   Antigravity,
+}
 
 // Record is the normalized activity model shared by every source adapter.
 // Adapters only read agent-owned data. Declaw stores the resulting summary in
@@ -86,12 +97,15 @@ func NormalizeHarness(value string) (Harness, error) {
 	if harness == "" || harness == "inherit" || harness == "default" {
 		return "", nil
 	}
+	if canonical, ok := harnessAliases[string(harness)]; ok {
+		harness = canonical
+	}
 	for _, supported := range supportedHarnesses {
 		if harness == supported {
 			return supported, nil
 		}
 	}
-	return "", errors.New("harness must be pi, hermes, codex, or claude")
+	return "", errors.New("harness must be one of " + strings.Join(SupportedHarnesses(), ", "))
 }
 
 func IsSupportedHarness(value string) bool {
@@ -129,10 +143,12 @@ func CommandForHarness(harness Harness, prompt string) (string, []string, error)
 	}
 
 	candidates := map[Harness][]string{
-		Pi:     {"pi"},
-		Hermes: {"hermes", "hermes-agent"},
-		Codex:  {"codex"},
-		Claude: {"claude"},
+		Pi:          {"pi"},
+		Hermes:      {"hermes", "hermes-agent"},
+		Codex:       {"codex"},
+		Claude:      {"claude"},
+		OpenCode:    {"opencode"},
+		Antigravity: {"agy", "antigravity"},
 	}
 	var program string
 	for _, candidate := range candidates[harness] {
@@ -150,6 +166,8 @@ func CommandForHarness(harness Harness, prompt string) (string, []string, error)
 		args = []string{"--sandbox", "danger-full-access", "--ask-for-approval", "never"}
 	case Claude:
 		args = []string{"--dangerously-skip-permissions", "--permission-mode", "bypassPermissions"}
+	case OpenCode:
+		args = []string{"--auto"}
 	}
 	if strings.TrimSpace(prompt) != "" {
 		args = append(args, strings.TrimSpace(prompt))
