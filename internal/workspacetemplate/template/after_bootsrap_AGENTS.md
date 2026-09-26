@@ -96,14 +96,17 @@ If it matters later, put it in the one place where it naturally belongs. Do not 
 Keep stable local environment facts here. Replace these placeholders during bootstrap if the facts are already known. Delete filler lines that are not useful.
 
 - `declaw` is the main local CLI for this workspace.
-- Use `declaw checkout <project>` to open the configured agent provider in a tracked project context.
-- Use `declaw settings provider codex` or `declaw settings provider claude` to choose the provider for free-text launcher input, checkout, and `ai-agent`.
+- Use `declaw checkout <project>` to open the tracked project's provider override when set, otherwise the configured global provider.
+- Use `declaw settings provider codex` or `declaw settings provider claude` to choose the global provider for free-text launcher input, `ai-agent`, and any project without an override.
+- Use `declaw settings terminal ghostty` to open scheduled interactive jobs in Ghostty instead of Terminal.
+- Use `declaw project settings <name> provider codex|claude|inherit` to override one tracked project's preferred provider.
 - Use `declaw schedule codex ...` for scheduled Codex jobs.
 - Use `declaw schedule claude ...` for scheduled Claude Code jobs.
+- Use `declaw schedule create ... --provider default ...` when the schedule should resolve through the tracked project's provider override first and otherwise use the global provider.
 - Recurring agent schedules require `--project <name>`.
 - If an existing directory should become a recurring agent target, use `declaw track <name> --path <dir>` first.
 - One-off agent schedules may use `--project`, `--workspace`, or no target.
-- Scheduled Codex jobs use declaw's app-server chat UI by default. Use `--ui declaw` for the legacy `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted.
+- Scheduled Codex jobs use declaw's app-server chat UI by default. Use `--ui declaw` only for the legacy colored `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted.
 - Scheduled Claude jobs use the raw Claude TUI by default. Use `--ui declaw` for declaw's chat UI, and `--ui print` for headless `claude -p` runs.
 - [Replace this line during bootstrap with any stable local hostnames, device names, browser or terminal preferences, path quirks, or other environment facts that are genuinely useful across sessions.]
 
@@ -150,7 +153,7 @@ When a user asks to schedule future work:
 - always pass `--project <name>` for recurring agent schedules
 - if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
 - for one-off agent schedules only, `--workspace <path>` or no target is allowed
-- scheduled Codex jobs use declaw's app-server chat UI by default; use `--ui declaw` for the legacy `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted
+- scheduled Codex jobs use declaw's app-server chat UI by default; use `--ui declaw` only for the legacy colored `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted
 - scheduled Claude jobs use the raw Claude TUI by default; use `--ui declaw` for declaw's chat UI, and `--ui print` for headless `claude -p` runs
 - only schedule future work when an agent should run
 
@@ -168,13 +171,16 @@ declaw path <name>
 declaw checkout <name>
 declaw settings provider codex
 declaw settings provider claude
+declaw settings terminal [terminal|ghostty]
+declaw project settings <name> provider [codex|claude|inherit]
 declaw ai-agent "<task>"
 declaw schedule list
+declaw schedule create <job> --provider [codex|claude|default] --project <name> --ui <mode> --daily HH:MM --prompt "<task>"
 declaw schedule codex <job> --project <name> --daily HH:MM --prompt "<task>"
 declaw schedule claude <job> --project <name> --daily HH:MM --prompt "<task>"
 ```
 
-Use `declaw schedule codex ...` or `declaw schedule claude ...` when the user wants future agent work to run by itself. Use `declaw checkout <project>` when the user wants to chat in an existing tracked project context now; it follows `declaw settings provider`.
+Use `declaw schedule codex ...` or `declaw schedule claude ...` when the user wants future agent work to run by itself. Use `declaw schedule create ... --provider default` when the provider should follow the tracked project's override first and fall back to `declaw settings provider`. Use `declaw checkout <project>` when the user wants to chat in an existing tracked project context now; it follows the tracked project's provider override first and otherwise uses `declaw settings provider`.
 
 ## Safety
 

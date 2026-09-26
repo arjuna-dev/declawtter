@@ -5,6 +5,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"declaw/internal/instructions"
 )
 
 //go:embed all:template
@@ -13,7 +15,7 @@ var templateFS embed.FS
 const SourceName = "embedded"
 
 func Copy(targetRoot string) error {
-	return fs.WalkDir(templateFS, "template", func(path string, entry fs.DirEntry, err error) error {
+	if err := fs.WalkDir(templateFS, "template", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -38,5 +40,8 @@ func Copy(targetRoot string) error {
 			return err
 		}
 		return os.WriteFile(targetPath, data, 0o644)
-	})
+	}); err != nil {
+		return err
+	}
+	return instructions.EnsureClaudeAlias(targetRoot)
 }

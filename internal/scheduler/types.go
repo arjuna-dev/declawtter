@@ -18,9 +18,11 @@ type JobRecord struct {
 	Type               string         `json:"type"`
 	CreatedAt          time.Time      `json:"created_at"`
 	Config             ScheduleConfig `json:"config"`
+	Paused             bool           `json:"paused,omitempty"`
 	Prompt             string         `json:"prompt,omitempty"`
 	Workspace          string         `json:"workspace,omitempty"`
 	UI                 string         `json:"ui,omitempty"`
+	AgentColor         string         `json:"agent_color,omitempty"`
 	Cwd                string         `json:"cwd,omitempty"`
 	Stdout             string         `json:"stdout,omitempty"`
 	Stderr             string         `json:"stderr,omitempty"`
@@ -29,5 +31,6 @@ type JobRecord struct {
 	PrimaryLabel       string         `json:"primary_label"`
 	RecoveryLabel      string         `json:"recovery_label,omitempty"`
 	OnceLabel          string         `json:"once_label,omitempty"`
+	OnceRecoveryLabel  string         `json:"once_recovery_label,omitempty"`
 	WorkspaceBootstrap bool           `json:"workspace_bootstrap"`
 }

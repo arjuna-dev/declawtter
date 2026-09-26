@@ -5,13 +5,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"declaw/internal/instructions"
 )
 
 //go:embed all:template
 var workspaceFS embed.FS
 
 func Ensure(root string) error {
-	return fs.WalkDir(workspaceFS, "template", func(path string, entry fs.DirEntry, err error) error {
+	if err := fs.WalkDir(workspaceFS, "template", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -28,9 +30,6 @@ func Ensure(root string) error {
 			return os.MkdirAll(targetPath, 0o755)
 		}
 
-		if _, err := os.Stat(targetPath); err == nil {
-			return nil
-		}
 		data, err := workspaceFS.ReadFile(path)
 		if err != nil {
 			return err
@@ -38,6 +37,23 @@ func Ensure(root string) error {
 		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 			return err
 		}
+		if shouldPreserveExistingWorkspaceFile(rel) {
+			if _, err := os.Stat(targetPath); err == nil {
+				return nil
+			}
+		}
 		return os.WriteFile(targetPath, data, 0o644)
-	})
+	}); err != nil {
+		return err
+	}
+	return instructions.EnsureClaudeAlias(root)
+}
+
+func shouldPreserveExistingWorkspaceFile(rel string) bool {
+	switch rel {
+	case "AGENTS.md", "README.md", "CLAUDE.md":
+		return false
+	default:
+		return true
+	}
 }

@@ -61,8 +61,8 @@ func TestChatInputWidth(t *testing.T) {
 func TestChatInputStartsAtOneRow(t *testing.T) {
 	model := newDeclawChatInputModel()
 
-	if got := model.input.Height(); got != 1 {
-		t.Fatalf("initial input height = %d, want 1", got)
+	if got := model.input.Height(); got != 2 {
+		t.Fatalf("initial input height = %d, want 2", got)
 	}
 }
 
@@ -87,5 +87,57 @@ func TestChatInputRowsGrowForNewlinesAndWrapping(t *testing.T) {
 				t.Fatalf("chatInputRows(%q, %d) = %d, want %d", tt.value, tt.width, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestChatInputHeightUpdatesAfterTypingNewline(t *testing.T) {
+	model := newDeclawChatInputModel()
+
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("hello")},
+		{Type: tea.KeyCtrlJ},
+		{Type: tea.KeyRunes, Runes: []rune("world")},
+	} {
+		updated, _ := model.Update(key)
+		model = updated.(declawChatInputModel)
+	}
+
+	if got := model.input.Height(); got != 3 {
+		t.Fatalf("input height = %d, want 3", got)
+	}
+}
+
+func TestChatInputHeightUpdatesAfterWrapping(t *testing.T) {
+	model := newDeclawChatInputModel()
+	model.input.SetWidth(8)
+	message := strings.Repeat("x", 9)
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(message)})
+	model = updated.(declawChatInputModel)
+
+	if got := model.input.Height(); got != 3 {
+		t.Fatalf("input height = %d, want 3", got)
+	}
+}
+
+func TestChatInputViewKeepsEarlierLinesVisible(t *testing.T) {
+	model := newDeclawChatInputModel()
+
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("hello")},
+		{Type: tea.KeyCtrlJ},
+		{Type: tea.KeyRunes, Runes: []rune("world")},
+		{Type: tea.KeyCtrlJ},
+		{Type: tea.KeyRunes, Runes: []rune("again")},
+	} {
+		updated, _ := model.Update(key)
+		model = updated.(declawChatInputModel)
+	}
+
+	view := model.input.View()
+	for _, want := range []string{"hello", "world", "again"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("input view %q does not contain %q", view, want)
+		}
 	}
 }

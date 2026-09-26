@@ -58,7 +58,7 @@ When the user wants to schedule future work:
 - always pass `--project <name>` for recurring agent schedules
 - if the target directory already exists but is not tracked, run `declaw track <name> --path <dir>` first, then schedule with `--project <name>`
 - for one-off agent schedules only, `--workspace <path>` or no target is allowed
-- scheduled Codex jobs use declaw's app-server chat UI by default; use `--ui declaw` for the legacy `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted
+- scheduled Codex jobs use declaw's app-server chat UI by default; use `--ui declaw` only for the legacy colored `codex exec` chat UI, and `--ui codex` only when raw Codex TUI output is wanted
 - scheduled Claude jobs use the raw Claude TUI by default; use `--ui declaw` for declaw's chat UI, and `--ui print` for headless `claude -p` runs
 - only schedule future work when an agent should run
 - only avoid scheduling when the user clearly does not want a scheduled action
@@ -77,13 +77,16 @@ declaw path <name>
 declaw checkout <name>
 declaw settings provider codex
 declaw settings provider claude
+declaw settings terminal [terminal|ghostty]
+declaw project settings <name> provider [codex|claude|inherit]
 declaw ai-agent "<task>"
 declaw schedule list
+declaw schedule create <job> --provider [codex|claude|default] --project <name> --ui <mode> --daily HH:MM --prompt "<task>"
 declaw schedule codex <job> --project <name> --daily HH:MM --prompt "<task>"
 declaw schedule claude <job> --project <name> --daily HH:MM --prompt "<task>"
 ```
 
-Use `declaw schedule codex ...` or `declaw schedule claude ...` when the user wants future agent work to run by itself. Use `declaw checkout <project>` when the user wants to chat in an existing tracked project context now; it follows `declaw settings provider`.
+Use `declaw schedule codex ...` or `declaw schedule claude ...` when the user wants future agent work to run by itself. Use `declaw schedule create ... --provider default` when the provider should follow the tracked project's override first and fall back to `declaw settings provider`. Use `declaw checkout <project>` when the user wants to chat in an existing tracked project context now; it follows the tracked project's provider override first and otherwise uses `declaw settings provider`.
 
 ## Handoff After Bootstrap
 

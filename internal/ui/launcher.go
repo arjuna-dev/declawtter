@@ -11,9 +11,15 @@ import (
 )
 
 type Command struct {
+	// Name is the human-readable command label shown in the launcher. Most
+	// commands also use it as their executable command line.
 	Name        string
 	Description string
 	Children    []Command
+	// CommandLine keeps a stable, parser-safe command behind a friendly label.
+	// It is useful when a display name contains spaces or is derived from a
+	// project path.
+	CommandLine string
 }
 
 type Result struct {
@@ -25,23 +31,29 @@ const visibleCommandLimit = 12
 
 func Commands() []Command {
 	return []Command{
-		{Name: "/create", Description: "Create a new declaw project/assistant"},
-		{Name: "/track", Description: "Track an existing directory as a declaw project"},
-		{Name: "/checkout", Description: "Open the configured agent in a tracked project"},
+		{Name: "/checkout", Description: "Open a recent project with its last used harness"},
+		{Name: "/schedule", Description: "Schedule commands and installed jobs", Children: ScheduleCommands()},
+		{Name: "/create", Description: "Create an empty project in the current directory"},
+		{Name: "/track", Description: "Track the current directory after confirmation"},
+		{Name: "/project-settings", Description: "Manage per-project settings"},
 		{Name: "/settings", Description: "Show or change declaw settings", Children: SettingsCommands()},
 		{Name: "/list", Description: "List tracked projects"},
-		{Name: "/path", Description: "Print a tracked project path"},
-		{Name: "/remove", Description: "Remove a tracked project"},
-		{Name: "/schedule", Description: "Schedule commands and installed jobs", Children: ScheduleCommands()},
 		{Name: "/exit", Description: "Exit declaw"},
 	}
 }
 
 func SettingsCommands() []Command {
 	return []Command{
-		{Name: "/settings provider", Description: "Print the configured agent provider"},
-		{Name: "/settings provider codex", Description: "Use Codex for launcher input and checkout"},
-		{Name: "/settings provider claude", Description: "Use Claude Code for launcher input and checkout"},
+		{Name: "/settings harness", Description: "Print the configured agent harness"},
+		{Name: "/settings harness pi", Description: "Use Pi for launcher input and checkout"},
+		{Name: "/settings harness hermes", Description: "Use Hermes for launcher input and checkout"},
+		{Name: "/settings harness codex", Description: "Use Codex for launcher input and checkout"},
+		{Name: "/settings harness claude", Description: "Use Claude Code for launcher input and checkout"},
+		{Name: "/settings provider codex", Description: "Compatibility alias for the Codex harness"},
+		{Name: "/settings provider claude", Description: "Compatibility alias for the Claude harness"},
+		{Name: "/settings codex-reasoning", Description: "Print the configured Codex reasoning mode"},
+		{Name: "/settings codex-reasoning default", Description: "Use Codex default reasoning"},
+		{Name: "/settings codex-reasoning no_reasoning", Description: "Use Codex no_reasoning mode with GPT-5.5"},
 	}
 }
 
@@ -51,6 +63,8 @@ func ScheduleCommands() []Command {
 		{Name: "/schedule status", Description: "Show launchctl status for a job"},
 		{Name: "/schedule enable", Description: "Enable a scheduled job"},
 		{Name: "/schedule disable", Description: "Disable a scheduled job"},
+		{Name: "/schedule pause", Description: "Pause a scheduled job without removing it"},
+		{Name: "/schedule resume", Description: "Resume a paused scheduled job"},
 		{Name: "/schedule restart", Description: "Restart a scheduled job"},
 		{Name: "/schedule run", Description: "Trigger a scheduled job immediately"},
 		{Name: "/schedule remove", Description: "Remove a scheduled job"},
@@ -58,6 +72,9 @@ func ScheduleCommands() []Command {
 		{Name: "/schedule prune-once", Description: "Clean up completed one-off job records"},
 		{Name: "/schedule get-prompt", Description: "Print the stored prompt for an agent schedule"},
 		{Name: "/schedule get-time", Description: "Print the stored time for a schedule"},
+		{Name: "/schedule create", Description: "Schedule a run via provider resolution"},
+		{Name: "/schedule pi", Description: "Schedule a Pi run"},
+		{Name: "/schedule hermes", Description: "Schedule a Hermes run"},
 		{Name: "/schedule codex", Description: "Schedule a Codex run"},
 		{Name: "/schedule claude", Description: "Schedule a Claude Code run"},
 		{Name: "/schedule edit", Description: "Edit an existing scheduled job, including provider"},
@@ -111,9 +128,13 @@ func newLauncherModel(commands []Command) launcherModel {
 	ti.Placeholder = "Ask declaw..."
 	ti.CharLimit = 4000
 	ti.SetWidth(80)
-	ti.SetHeight(1)
+	ti.SetHeight(2)
 	ti.ShowLineNumbers = false
-	ti.Prompt = "> "
+	ti.Prompt = ""
+	ti.FocusedStyle.Base = lipgloss.NewStyle().
+		Background(lipgloss.Color("236")).
+		Padding(0, 1)
+	ti.BlurredStyle.Base = ti.FocusedStyle.Base
 	ti.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ti.BlurredStyle.CursorLine = lipgloss.NewStyle()
 	ti.KeyMap.InsertNewline.SetKeys("ctrl+j")
@@ -185,9 +206,16 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selected = 0
 					return m, nil
 				}
-				m.input.SetValue(m.filtered[m.selected].Name + " ")
+				m.commandLine = commandLine(m.filtered[m.selected])
+				return m, tea.Quit
+			}
+			if len(m.filtered) > 0 && m.selected < len(m.filtered) && strings.EqualFold(line, m.filtered[m.selected].Name) && len(m.filtered[m.selected].Children) > 0 {
+				m.breadcrumbs = append(m.breadcrumbs, m.filtered[m.selected].Name)
+				m.commandStack = append(m.commandStack, m.commands)
+				m.commands = m.filtered[m.selected].Children
+				m.input.SetValue("")
 				m.updateInputHeight()
-				m.filtered = m.filterCommands(m.input.Value())
+				m.filtered = m.filterCommands("")
 				m.selected = 0
 				return m, nil
 			}
@@ -202,7 +230,7 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selected = 0
 					return m, nil
 				}
-				m.input.SetValue(m.filtered[m.selected].Name + " ")
+				m.input.SetValue(commandLine(m.filtered[m.selected]) + " ")
 				m.updateInputHeight()
 				m.filtered = m.filterCommands(m.input.Value())
 				m.selected = 0
@@ -225,7 +253,7 @@ func (m launcherModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *launcherModel) updateInputHeight() {
-	m.input.SetHeight(launcherInputRows(m.input.Value(), m.input.Width()))
+	m.input.SetHeight(launcherInputHeight(m.input.Value(), m.input.Width()))
 }
 
 func launcherInputRows(value string, width int) int {
@@ -249,6 +277,10 @@ func launcherInputRows(value string, width int) int {
 		return 1
 	}
 	return rows
+}
+
+func launcherInputHeight(value string, width int) int {
+	return max(2, launcherInputRows(value, width)+1)
 }
 
 func (m *launcherModel) adjustOffset() {
@@ -351,12 +383,20 @@ func (m launcherModel) filterCommands(input string) []Command {
 	filtered := make([]Command, 0, len(m.commands))
 	for _, command := range m.commands {
 		name := strings.ToLower(command.Name)
+		commandLine := strings.ToLower(commandLine(command))
 		desc := strings.ToLower(command.Description)
-		if strings.Contains(name, needle) || strings.Contains(desc, query) {
+		if strings.Contains(name, needle) || strings.Contains(commandLine, needle) || strings.Contains(desc, query) {
 			filtered = append(filtered, command)
 		}
 	}
 	return filtered
+}
+
+func commandLine(command Command) string {
+	if strings.TrimSpace(command.CommandLine) != "" {
+		return command.CommandLine
+	}
+	return command.Name
 }
 
 func (m launcherModel) hideCommands() bool {

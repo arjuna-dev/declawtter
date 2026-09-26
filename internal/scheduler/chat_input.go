@@ -71,9 +71,13 @@ func newDeclawChatInputModel() declawChatInputModel {
 	ti.Placeholder = "Message declaw..."
 	ti.CharLimit = 20000
 	ti.SetWidth(90)
-	ti.SetHeight(1)
+	ti.SetHeight(2)
 	ti.ShowLineNumbers = false
-	ti.Prompt = colorize("You > ", ansiBlue)
+	ti.Prompt = ""
+	ti.FocusedStyle.Base = lipgloss.NewStyle().
+		Background(lipgloss.Color("236")).
+		Padding(0, 1)
+	ti.BlurredStyle.Base = ti.FocusedStyle.Base
 	ti.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ti.BlurredStyle.CursorLine = lipgloss.NewStyle()
 	ti.KeyMap.InsertNewline.SetKeys("ctrl+j")
@@ -132,7 +136,7 @@ func (m declawChatInputModel) View() string {
 }
 
 func (m *declawChatInputModel) updateInputHeight() {
-	m.input.SetHeight(chatInputRows(m.input.Value(), m.input.Width()))
+	m.input.SetHeight(chatInputHeight(m.input.Value(), m.input.Width()))
 }
 
 func (m declawChatInputModel) expandPasteMarkers(display string) string {
@@ -178,6 +182,10 @@ func chatInputRows(value string, width int) int {
 		return 1
 	}
 	return rows
+}
+
+func chatInputHeight(value string, width int) int {
+	return max(2, chatInputRows(value, width)+1)
 }
 
 func pasteRuneCount(value string) int {

@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"declaw/internal/settings"
 )
 
 type codexAppServerClient struct {
@@ -42,9 +44,6 @@ type appServerTurnState struct {
 }
 
 func runCodexAppServerChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
-	if strings.TrimSpace(prompt) == "" {
-		return errors.New("missing Codex prompt")
-	}
 	if _, err := exec.LookPath("codex"); err != nil {
 		return errors.New("codex command not found in PATH")
 	}
@@ -59,11 +58,11 @@ func runCodexAppServerChat(prompt, workspace, jobName string, extraEnv map[strin
 	agentName := declawAgentName(workspace)
 	stateless := codexAppServerStateless(extraEnv)
 	if !stateless {
-		printRecentDeclawChatHistory(workspace, agentName, declawChatHistoryLimit)
+		printRecentDeclawChatHistory(workspace, agentName, declawChatHistoryLimit, "")
 	}
 
 	transcriptPath := ""
-	if !stateless {
+	if !stateless && strings.TrimSpace(prompt) != "" {
 		var err error
 		transcriptPath, err = startDeclawChatTranscript(workspace, jobName, prompt)
 		if err != nil {
@@ -82,14 +81,17 @@ func runCodexAppServerChat(prompt, workspace, jobName string, extraEnv map[strin
 		return err
 	}
 
-	displayMessage, err := client.runTurn(threadID, prompt)
-	if err != nil {
-		return err
-	}
-	if displayMessage != "" {
-		printDeclawChatMessage(agentName, displayMessage)
-		if transcriptPath != "" {
-			_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
+	if strings.TrimSpace(prompt) != "" {
+		displayMessage, err := client.runTurn(threadID, prompt)
+		if err != nil {
+			return err
+		}
+		_ = markRunComplete(completionRoot(extraEnv), sanitizeName(jobName), envValue(extraEnv, "DECLAW_TRIGGER_KIND"), "Codex app-server", "")
+		if displayMessage != "" {
+			printDeclawChatMessage(agentName, displayMessage, "")
+			if transcriptPath != "" {
+				_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
+			}
 		}
 	}
 
@@ -128,7 +130,13 @@ func runCodexAppServerChat(prompt, workspace, jobName string, extraEnv map[strin
 			continue
 		}
 
-		if transcriptPath != "" {
+		if transcriptPath == "" && !stateless {
+			var err error
+			transcriptPath, err = startDeclawChatTranscript(workspace, jobName, message)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not create visible chat transcript: %s\n", err)
+			}
+		} else if transcriptPath != "" {
 			_ = appendDeclawChatMessage(transcriptPath, "User", message)
 		}
 		displayMessage, err := client.runTurn(threadID, message)
@@ -138,7 +146,7 @@ func runCodexAppServerChat(prompt, workspace, jobName string, extraEnv map[strin
 			continue
 		}
 		if displayMessage != "" {
-			printDeclawChatMessage(agentName, displayMessage)
+			printDeclawChatMessage(agentName, displayMessage, "")
 			if transcriptPath != "" {
 				_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
 			}
@@ -147,12 +155,18 @@ func runCodexAppServerChat(prompt, workspace, jobName string, extraEnv map[strin
 }
 
 func startCodexAppServer(workspace string, extraEnv map[string]string, stderrPath string) (*codexAppServerClient, error) {
-	cmd := exec.Command(
-		"codex",
-		"app-server",
-		"-c", "shell_environment_policy.inherit=all",
-		"--listen", "stdio://",
-	)
+	reasoningMode := "default"
+	if manager, err := settings.NewManager(); err == nil {
+		if mode, err := manager.CodexReasoningMode(); err == nil {
+			reasoningMode = mode
+		}
+	}
+	args := []string{"app-server"}
+	if settings.ValidateCodexReasoningMode(reasoningMode) == nil && strings.TrimSpace(strings.ToLower(reasoningMode)) == "no_reasoning" {
+		args = append(args, "-m", "gpt-5.5", "-c", `model_reasoning_effort="none"`, "--disable", "image_generation")
+	}
+	args = append(args, "-c", "shell_environment_policy.inherit=all", "--listen", "stdio://")
+	cmd := exec.Command("codex", args...)
 	if workspace != "" {
 		cmd.Dir = workspace
 	}
@@ -219,7 +233,7 @@ func (c *codexAppServerClient) initialize() error {
 func (c *codexAppServerClient) startThread(workspace string, stateless bool) (string, error) {
 	params := map[string]any{
 		"serviceName":            "declaw",
-		"approvalPolicy":         "on-request",
+		"approvalPolicy":         "never",
 		"sandbox":                "danger-full-access",
 		"experimentalRawEvents":  false,
 		"persistExtendedHistory": !stateless,

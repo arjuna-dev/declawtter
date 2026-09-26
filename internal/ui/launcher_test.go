@@ -43,8 +43,8 @@ func TestLauncherInputHeightUpdatesAfterTypingNewline(t *testing.T) {
 		model = updated.(launcherModel)
 	}
 
-	if got := model.input.Height(); got != 2 {
-		t.Fatalf("input height = %d, want 2", got)
+	if got := model.input.Height(); got != 3 {
+		t.Fatalf("input height = %d, want 3", got)
 	}
 }
 
@@ -56,7 +56,72 @@ func TestLauncherInputHeightUpdatesAfterWrapping(t *testing.T) {
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(message)})
 	model = updated.(launcherModel)
 
-	if got := model.input.Height(); got != 2 {
-		t.Fatalf("input height = %d, want 2", got)
+	if got := model.input.Height(); got != 3 {
+		t.Fatalf("input height = %d, want 3", got)
+	}
+}
+
+func TestLauncherInputViewKeepsEarlierLinesVisible(t *testing.T) {
+	model := newLauncherModel(Commands())
+
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("hello")},
+		{Type: tea.KeyCtrlJ},
+		{Type: tea.KeyRunes, Runes: []rune("world")},
+		{Type: tea.KeyCtrlJ},
+		{Type: tea.KeyRunes, Runes: []rune("again")},
+	} {
+		updated, _ := model.Update(key)
+		model = updated.(launcherModel)
+	}
+
+	view := model.input.View()
+	for _, want := range []string{"hello", "world", "again"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("input view %q does not contain %q", view, want)
+		}
+	}
+}
+
+func TestCommandsPutCheckoutAndScheduleFirst(t *testing.T) {
+	commands := Commands()
+	if len(commands) < 2 {
+		t.Fatalf("commands = %#v, want checkout and schedule", commands)
+	}
+	if commands[0].Name != "/checkout" || commands[1].Name != "/schedule" {
+		t.Fatalf("first commands = %q, %q; want checkout, schedule", commands[0].Name, commands[1].Name)
+	}
+	for _, command := range commands {
+		if command.Name == "/path" || command.Name == "/remove" {
+			t.Fatalf("legacy top-level project command still visible: %s", command.Name)
+		}
+	}
+}
+
+func TestSettingsListContainsAllHarnesses(t *testing.T) {
+	commands := SettingsCommands()
+	for _, harness := range []string{"pi", "hermes", "codex", "claude"} {
+		found := false
+		for _, command := range commands {
+			if command.Name == "/settings harness "+harness {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("settings commands = %#v, missing %s", commands, harness)
+		}
+	}
+}
+
+func TestLauncherRunsCanonicalCommandForFriendlyLabel(t *testing.T) {
+	model := newLauncherModel([]Command{{
+		Name:        "/project-settings Customer Portal path",
+		CommandLine: "/project-settings project-id path",
+	}})
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(launcherModel)
+	if got, want := model.commandLine, "/project-settings project-id path"; got != want {
+		t.Fatalf("launcher command line = %q, want %q", got, want)
 	}
 }

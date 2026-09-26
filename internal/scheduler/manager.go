@@ -3,6 +3,7 @@ package scheduler
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -18,8 +19,12 @@ import (
 	"strings"
 	"time"
 
+	"declaw/internal/activity"
 	"declaw/internal/cliargs"
+	"declaw/internal/instructions"
+	"declaw/internal/paths"
 	"declaw/internal/projects"
+	"declaw/internal/settings"
 )
 
 const (
@@ -32,20 +37,66 @@ const scheduledCodexPromptIntro = "You are running as a scheduled Codex job."
 
 const scheduledClaudePromptIntro = "You are running as a scheduled Claude Code job."
 
-const workspaceCodexPromptPrefix = "Use the current working directory as the workspace root.\nBefore doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting.\nDeclaw records the visible chat transcript automatically. Do not create or update `SESSIONS/` files unless the user explicitly asks you to."
-
-const recurringCodexPromptPrefix = "Before starting the main task, follow the workspace `AGENTS.md` memory convention. If a required prior-day memory entry is missing, create a concise distilled note in `MEMORY/` using the workspace's date format. Do not copy raw transcripts, tool logs, IDs, or long paths into memory unless that exact detail is necessary."
+const workspaceCodexPromptPrefix = "Use the current working directory as the workspace root.\nBefore doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting."
 
 const scheduledCodexChatHandoff = "When the initial scheduled work is done, answer the user directly in this chat. Write like you are texting a colleague who did not see your prompt, tool calls, or hidden reasoning. Start with enough context for the user to understand why this message exists, then give the useful result. Do not make the user open files to understand the result. Mention files only as backup or trace. If the task asks for an artifact, include the artifact itself in the chat. Keep process narration brief and focus on what the user can actually use next."
 
 const scheduledCodexLocalToolPrefix = "For scheduled non-interactive local CLI checks, prefer command flags over prompts. If using `gog` and `GOG_ACCOUNT` is set, pass `--account \"$GOG_ACCOUNT\"` explicitly; `gog` does not use that environment variable as the default account selector. Also pass `--no-input` for read-only scheduled checks so failures are explicit instead of waiting for terminal input."
 
+const scheduledCompletionInstruction = "When the main task is successfully complete, run `declaw schedule complete` exactly once before your final answer. Do not run it early. Do not run it if the task failed or is still incomplete."
+
+const rawUISessionTranscriptInstruction = "For this raw agent UI session, maintain a transcript in the current workspace: create/open a session transcript file under SESSIONS/; append each user-visible response as the session progresses; do not include command outcomes or file changes; update the file before final response."
+
+const rawUIReadinessTimeout = 60 * time.Second
+
+const rawUIReadinessPollInterval = 5 * time.Second
+
+func claudePermissionArgs() []string {
+	return []string{"--dangerously-skip-permissions", "--permission-mode", "bypassPermissions"}
+}
+
+func codexPermissionArgs() []string {
+	return []string{"--sandbox", "danger-full-access", "--ask-for-approval", "never"}
+}
+
+func codexReasoningArgs(mode string) []string {
+	if settings.ValidateCodexReasoningMode(mode) == nil && strings.TrimSpace(strings.ToLower(mode)) == "no_reasoning" {
+		return []string{"-m", "gpt-5.5", "-c", `model_reasoning_effort="none"`, "--disable", "image_generation"}
+	}
+	return nil
+}
+
+func codexDefaultArgs(mode string) []string {
+	args := codexPermissionArgs()
+	args = append(args, codexReasoningArgs(mode)...)
+	return args
+}
+
+func codexExecArgs(mode string) []string {
+	return codexReasoningArgs(mode)
+}
+
 var declawSpinnerFrames = []string{"|", "/", "-", "\\"}
 
 const declawChatHistoryLimit = 3
 
+const defaultDeclawAgentColor = "green"
+
+var declawAgentColors = []struct {
+	Name string
+	ANSI string
+}{
+	{Name: "green", ANSI: ansiGreen},
+	{Name: "yellow", ANSI: "\x1b[33m"},
+	{Name: "blue", ANSI: "\x1b[34m"},
+	{Name: "magenta", ANSI: "\x1b[35m"},
+	{Name: "cyan", ANSI: "\x1b[36m"},
+	{Name: "red", ANSI: "\x1b[31m"},
+}
+
 type Manager struct {
 	projects        *projects.Manager
+	settings        *settings.Manager
 	supportDir      string
 	runsDir         string
 	jobsDir         string
@@ -59,12 +110,11 @@ type JobStore struct {
 	Jobs map[string]JobRecord `json:"jobs"`
 }
 
-func NewManager(projectsManager *projects.Manager) (*Manager, error) {
+func NewManager(projectsManager *projects.Manager, settingsManager *settings.Manager) (*Manager, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-
 	currentUser, err := user.Current()
 	if err != nil {
 		return nil, err
@@ -74,7 +124,10 @@ func NewManager(projectsManager *projects.Manager) (*Manager, error) {
 		return nil, err
 	}
 
-	supportDir := filepath.Join(home, ".local", "share", "declaw")
+	supportDir, err := paths.SupportDir()
+	if err != nil {
+		return nil, err
+	}
 	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	for _, path := range []string{supportDir, filepath.Join(supportDir, "runs"), filepath.Join(supportDir, "logs"), filepath.Join(supportDir, "jobs"), launchAgentsDir} {
 		if err := os.MkdirAll(path, 0o755); err != nil {
@@ -84,6 +137,7 @@ func NewManager(projectsManager *projects.Manager) (*Manager, error) {
 
 	return &Manager{
 		projects:        projectsManager,
+		settings:        settingsManager,
 		supportDir:      supportDir,
 		runsDir:         filepath.Join(supportDir, "runs"),
 		jobsDir:         filepath.Join(supportDir, "jobs"),
@@ -111,16 +165,26 @@ func (m *Manager) Execute(args []string) (string, error) {
 		return m.enable(args[1:])
 	case "disable":
 		return m.disable(args[1:])
+	case "pause":
+		return m.pause(args[1:])
+	case "resume":
+		return m.resume(args[1:])
 	case "restart":
 		return m.restart(args[1:])
 	case "run":
 		return m.runJob(args[1:])
+	case "complete":
+		return m.complete(args[1:])
+	case "ready":
+		return m.ready(args[1:])
 	case "remove":
 		return m.remove(args[1:])
 	case "remove-all":
 		return m.removeAll(args[1:])
 	case "prune-once":
 		return m.pruneOnce(args[1:])
+	case "colors":
+		return declawColorsHelp(), nil
 	case "get-prompt":
 		return m.getPrompt(args[1:])
 	case "get-time":
@@ -129,6 +193,12 @@ func (m *Manager) Execute(args []string) (string, error) {
 		return m.scheduleCodex(args[1:])
 	case "claude":
 		return m.scheduleClaude(args[1:])
+	case "pi":
+		return m.scheduleNativeHarness("pi", args[1:])
+	case "hermes":
+		return m.scheduleNativeHarness("hermes", args[1:])
+	case "create":
+		return m.create(args[1:])
 	case "edit":
 		return m.edit(args[1:])
 	case "__internal":
@@ -221,6 +291,15 @@ func (m *Manager) status(args []string) (string, error) {
 	}
 	proc := m.runLaunchctl(true, "print", fmt.Sprintf("%s/%s", m.domain, label))
 	output := strings.TrimSpace(proc.Stdout + proc.Stderr)
+	state := "active"
+	if job.Paused {
+		state = "paused"
+	}
+	if output != "" {
+		output = fmt.Sprintf("state: %s\n%s", state, output)
+	} else {
+		output = "state: " + state
+	}
 	if proc.Err != nil {
 		return output, proc.Err
 	}
@@ -228,27 +307,41 @@ func (m *Manager) status(args []string) (string, error) {
 }
 
 func (m *Manager) enable(args []string) (string, error) {
-	return m.simpleLabelAction(args, "enabled", func(label string) error {
-		_, err := m.runLaunchctl(true, "enable", fmt.Sprintf("%s/%s", m.domain, label)).Output()
-		return err
-	})
+	return m.setPausedState(args, false, "enabled")
 }
 
 func (m *Manager) disable(args []string) (string, error) {
-	return m.simpleLabelAction(args, "disabled", func(label string) error {
-		_, err := m.runLaunchctl(false, "disable", fmt.Sprintf("%s/%s", m.domain, label)).Output()
-		return err
-	})
+	return m.setPausedState(args, true, "disabled")
+}
+
+func (m *Manager) pause(args []string) (string, error) {
+	return m.setPausedState(args, true, "paused")
+}
+
+func (m *Manager) resume(args []string) (string, error) {
+	return m.setPausedState(args, false, "resumed")
 }
 
 func (m *Manager) restart(args []string) (string, error) {
-	return m.simpleLabelAction(args, "restarted", func(label string) error {
+	if len(args) != 1 {
+		return "", errors.New("usage: declaw schedule restart <job>")
+	}
+	job, err := m.getJob(args[0])
+	if err != nil {
+		return "", err
+	}
+	lines := []string{}
+	for _, label := range labelsForJob(job) {
 		_ = m.bootout(label)
 		if err := m.bootstrap(label); err != nil {
-			return err
+			return "", err
 		}
-		return m.enableLabel(label)
-	})
+		if err := m.applyInstalledLabelState(label, job.Paused); err != nil {
+			return "", err
+		}
+		lines = append(lines, fmt.Sprintf("restarted %s", label))
+	}
+	return strings.Join(lines, "\n"), nil
 }
 
 func (m *Manager) runJob(args []string) (string, error) {
@@ -276,8 +369,64 @@ func (m *Manager) runJob(args []string) (string, error) {
 	return fmt.Sprintf("triggered %s", label), nil
 }
 
+func (m *Manager) complete(args []string) (string, error) {
+	fs := flag.NewFlagSet("complete", flag.ContinueOnError)
+	fs.SetOutput(bytes.NewBuffer(nil))
+
+	runDir := fs.String("run-dir", "", "run directory")
+	jobName := fs.String("job", "", "job name")
+	summary := fs.String("summary", "", "completion summary")
+	if err := fs.Parse(cliargs.ReorderForFlagSet(args, map[string]bool{
+		"run-dir": true,
+		"job":     true,
+		"summary": true,
+	})); err != nil {
+		return "", err
+	}
+	if len(fs.Args()) != 0 {
+		return "", errors.New("usage: declaw schedule complete [--run-dir <dir>] [--job <name>] [--summary <text>]")
+	}
+
+	resolvedRunDir := strings.TrimSpace(*runDir)
+	if resolvedRunDir == "" {
+		resolvedRunDir = completionRoot(nil)
+	}
+	if resolvedRunDir == "" {
+		return "", errors.New("missing run directory; use inside a scheduled declaw run or pass --run-dir")
+	}
+	resolvedJob := strings.TrimSpace(*jobName)
+	if resolvedJob == "" {
+		resolvedJob = sanitizeName(os.Getenv("DECLAW_SCHEDULE_JOB"))
+	}
+	if err := markRunComplete(resolvedRunDir, resolvedJob, os.Getenv("DECLAW_TRIGGER_KIND"), "declaw schedule complete", strings.TrimSpace(*summary)); err != nil {
+		return "", err
+	}
+	if resolvedJob != "" {
+		if err := m.cleanupOnceByJobName(resolvedJob); err != nil {
+			return "", err
+		}
+	}
+	return fmt.Sprintf("marked complete for %s", resolvedRunDir), nil
+}
+
+// ready is deliberately a small, public acknowledgement command: a headless
+// provider probe calls it before declaw opens a raw Codex or Claude terminal.
+func (m *Manager) ready(args []string) (string, error) {
+	if len(args) != 0 {
+		return "", errors.New("usage: declaw schedule ready")
+	}
+	runDir := strings.TrimSpace(os.Getenv("DECLAW_RUN_DIR"))
+	if runDir == "" {
+		return "", errors.New("missing run directory; declaw schedule ready is only available inside a scheduled run")
+	}
+	if err := markRunReady(runDir, os.Getenv("DECLAW_SCHEDULE_JOB"), os.Getenv("DECLAW_TRIGGER_KIND")); err != nil {
+		return "", err
+	}
+	return "scheduled agent readiness recorded", nil
+}
+
 func (m *Manager) runRecurringManual(job JobRecord) error {
-	if job.Type != "codex" && job.Type != "claude" {
+	if !isSupportedScheduleHarness(job.Type) {
 		return fmt.Errorf("unsupported schedule type %q", job.Type)
 	}
 	prompt, err := resolveRuntimePrompt("", m.promptPath(job.Name))
@@ -315,7 +464,7 @@ func (m *Manager) runRecurringManual(job JobRecord) error {
 	}, "\n")), 0o644); err != nil {
 		return err
 	}
-	exitCode := m.runRuntimeCommand(job.Type, job.Name, prompt, job.Workspace, job.UI, m.runtimeEnvForJob(job, "manual", runDir, job.Config.ScheduledTime))
+	exitCode := m.runRuntimeCommand(job.Type, job.Name, prompt, job.Workspace, job.UI, m.runtimeEnvForJob(job, "manual", runDir, job.Config.ScheduledTime), job.AgentColor)
 	finishedAt := time.Now().In(time.Local)
 	return appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -426,10 +575,19 @@ func (m *Manager) pruneOnce(args []string) (string, error) {
 		if job.Config.Kind != "once" {
 			continue
 		}
-		plist := m.installedPlistPath(job.OnceLabel)
-		if _, err := os.Stat(plist); errors.Is(err, os.ErrNotExist) {
+		missing := true
+		for _, label := range labelsForJob(job) {
+			if label == "" {
+				continue
+			}
+			if _, err := os.Stat(m.installedPlistPath(label)); err == nil {
+				missing = false
+				break
+			}
+		}
+		if missing {
 			delete(store.Jobs, name)
-			lines = append(lines, fmt.Sprintf("pruned %s", job.OnceLabel))
+			lines = append(lines, fmt.Sprintf("pruned %s", job.Name))
 			changed = true
 		}
 	}
@@ -450,7 +608,7 @@ func (m *Manager) getPrompt(args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if (job.Type != "codex" && job.Type != "claude") || job.Prompt == "" {
+	if !isSupportedScheduleHarness(job.Type) || job.Prompt == "" {
 		return "", fmt.Errorf("job %q does not have a stored agent prompt", args[0])
 	}
 	return job.Prompt, nil
@@ -493,7 +651,8 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 	cwd := fs.String("cwd", "", "cwd")
 	stdout := fs.String("stdout", "", "stdout")
 	stderr := fs.String("stderr", "", "stderr")
-	ui := fs.String("ui", "app-server", "scheduled Codex UI: app-server, declaw, or codex")
+	ui := fs.String("ui", "codex", "compatibility mode for an existing Codex schedule")
+	agentColor := fs.String("agent-color", "", "legacy compatibility option")
 	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
 	weekday := stringListFlag{}
 	env := stringListFlag{}
@@ -511,6 +670,9 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 		return "", errors.New("--prompt is required")
 	}
 	if err := validateCodexUI(*ui); err != nil {
+		return "", err
+	}
+	if err := validateAgentColorFlag(*ui, *agentColor); err != nil {
 		return "", err
 	}
 
@@ -538,7 +700,7 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 	}
 
 	jobName := sanitizeName(rest[0])
-	effectivePrompt := buildCodexPrompt(*prompt, config.Kind == "recurring", workspaceBootstrap)
+	effectivePrompt := buildCodexPrompt(*prompt, config.Kind == "recurring", workspaceBootstrap, *ui)
 	record := JobRecord{
 		Name:               jobName,
 		Type:               "codex",
@@ -547,18 +709,17 @@ func (m *Manager) scheduleCodex(args []string) (string, error) {
 		Prompt:             effectivePrompt,
 		Workspace:          resolvedWorkspace,
 		UI:                 normalizeCodexUI(*ui),
+		AgentColor:         normalizeDeclawAgentColor(*agentColor),
 		Cwd:                *cwd,
 		Stdout:             *stdout,
 		Stderr:             *stderr,
 		Env:                []string(env),
-		HasRecovery:        config.Kind == "recurring" && !*noRecurringFallback,
+		HasRecovery:        !*noRecurringFallback,
 		PrimaryLabel:       primaryLabel(jobName),
 		RecoveryLabel:      recoveryLabel(jobName),
 		OnceLabel:          onceLabel(jobName),
+		OnceRecoveryLabel:  onceRecoveryLabel(jobName),
 		WorkspaceBootstrap: workspaceBootstrap,
-	}
-	if config.Kind == "once" {
-		record.HasRecovery = false
 	}
 	return m.installAndStore(record)
 }
@@ -589,7 +750,8 @@ func (m *Manager) scheduleClaude(args []string) (string, error) {
 	cwd := fs.String("cwd", "", "cwd")
 	stdout := fs.String("stdout", "", "stdout")
 	stderr := fs.String("stderr", "", "stderr")
-	ui := fs.String("ui", "claude", "scheduled Claude UI: claude, declaw, or print")
+	ui := fs.String("ui", "claude", "compatibility mode for an existing Claude schedule")
+	agentColor := fs.String("agent-color", "", "legacy compatibility option")
 	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
 	weekday := stringListFlag{}
 	env := stringListFlag{}
@@ -607,6 +769,9 @@ func (m *Manager) scheduleClaude(args []string) (string, error) {
 		return "", errors.New("--prompt is required")
 	}
 	if err := validateClaudeUI(*ui); err != nil {
+		return "", err
+	}
+	if err := validateAgentColorFlag(*ui, *agentColor); err != nil {
 		return "", err
 	}
 
@@ -634,7 +799,7 @@ func (m *Manager) scheduleClaude(args []string) (string, error) {
 	}
 
 	jobName := sanitizeName(rest[0])
-	effectivePrompt := buildClaudePrompt(*prompt, config.Kind == "recurring", workspaceBootstrap)
+	effectivePrompt := buildClaudePrompt(*prompt, config.Kind == "recurring", workspaceBootstrap, *ui)
 	record := JobRecord{
 		Name:               jobName,
 		Type:               "claude",
@@ -643,20 +808,232 @@ func (m *Manager) scheduleClaude(args []string) (string, error) {
 		Prompt:             effectivePrompt,
 		Workspace:          resolvedWorkspace,
 		UI:                 normalizeClaudeUI(*ui),
+		AgentColor:         normalizeDeclawAgentColor(*agentColor),
 		Cwd:                *cwd,
 		Stdout:             *stdout,
 		Stderr:             *stderr,
 		Env:                []string(env),
-		HasRecovery:        config.Kind == "recurring" && !*noRecurringFallback,
+		HasRecovery:        !*noRecurringFallback,
 		PrimaryLabel:       primaryLabel(jobName),
 		RecoveryLabel:      recoveryLabel(jobName),
 		OnceLabel:          onceLabel(jobName),
+		OnceRecoveryLabel:  onceRecoveryLabel(jobName),
 		WorkspaceBootstrap: workspaceBootstrap,
 	}
-	if config.Kind == "once" {
-		record.HasRecovery = false
+	return m.installAndStore(record)
+}
+
+func (m *Manager) scheduleNativeHarness(harnessName string, args []string) (string, error) {
+	harness, err := activity.NormalizeHarness(harnessName)
+	if err != nil {
+		return "", err
+	}
+	if harness != activity.Pi && harness != activity.Hermes {
+		return "", fmt.Errorf("native scheduling is only available for pi or hermes, got %q", harnessName)
+	}
+	if hasHelpArg(args) {
+		return nativeHarnessHelp(harness), nil
+	}
+
+	fs := flag.NewFlagSet(string(harness), flag.ContinueOnError)
+	fs.SetOutput(bytes.NewBuffer(nil))
+
+	prompt := fs.String("prompt", "", "prompt")
+	projectName := fs.String("project", "", "tracked project")
+	workspace := fs.String("workspace", "", "workspace path")
+	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring schedules require --project")
+	daily := fs.String("daily", "", "daily time")
+	timeValue := fs.String("time", "", "daily time")
+	weekdays := fs.String("weekdays", "", "weekday time")
+	weekly := fs.String("weekly", "", "weekly")
+	at := fs.String("at", "", "one-off time")
+	once := fs.Bool("once", false, "one-off explicit schedule")
+	year := fs.Int("year", -1, "year")
+	month := fs.Int("month", -1, "month")
+	day := fs.Int("day", -1, "day")
+	hour := fs.Int("hour", -1, "hour")
+	minute := fs.Int("minute", -1, "minute")
+	cwd := fs.String("cwd", "", "cwd")
+	stdout := fs.String("stdout", "", "stdout")
+	stderr := fs.String("stderr", "", "stderr")
+	ui := fs.String("ui", "native", "native harness command")
+	requestedHarness := fs.String("harness", "", "harness")
+	noRecurringFallback := fs.Bool("no-recurring-fallback", false, "disable fallback")
+	weekday := stringListFlag{}
+	env := stringListFlag{}
+	fs.Var(&weekday, "weekday", "weekday")
+	fs.Var(&env, "env", "env")
+	if err := fs.Parse(cliargs.ReorderForFlagSet(args, scheduleValueFlags())); err != nil {
+		return "", err
+	}
+
+	if len(fs.Args()) != 1 {
+		return "", fmt.Errorf("usage: declaw schedule %s <job> --prompt <text> --project <name> [recurring flags] OR declaw schedule %s <job> --prompt <text> [--project <name> | --workspace <path>] --at \"YYYY-MM-DD HH:MM\"", harness, harness)
+	}
+	if strings.TrimSpace(*prompt) == "" {
+		return "", errors.New("--prompt is required")
+	}
+	if requested := strings.TrimSpace(*requestedHarness); requested != "" {
+		selected, err := activity.NormalizeHarness(requested)
+		if err != nil {
+			return "", err
+		}
+		if selected != harness {
+			return "", fmt.Errorf("--harness %s does not match schedule harness %s", selected, harness)
+		}
+	}
+	if normalizedUI := strings.ToLower(strings.TrimSpace(*ui)); normalizedUI != "" && normalizedUI != "native" {
+		return "", fmt.Errorf("%s schedules use the native harness command; --ui must be native", harness)
+	}
+	if strings.TrimSpace(*cwd) != "" {
+		if _, err := filepath.Abs(*cwd); err != nil {
+			return "", err
+		}
+	}
+
+	config, err := resolveScheduleConfig(scheduleShapeInput{
+		Daily:    *daily,
+		Time:     *timeValue,
+		Weekdays: *weekdays,
+		Weekly:   *weekly,
+		At:       *at,
+		Once:     *once,
+		Year:     *year,
+		Month:    *month,
+		Day:      *day,
+		Hour:     *hour,
+		Minute:   *minute,
+		Weekday:  []string(weekday),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	resolvedWorkspace, workspaceBootstrap, err := m.resolveWorkspace(*projectName, *workspace, *noWorkspace, config.Kind)
+	if err != nil {
+		return "", err
+	}
+
+	jobName := sanitizeName(fs.Args()[0])
+	record := JobRecord{
+		Name:               jobName,
+		Type:               string(harness),
+		CreatedAt:          time.Now().UTC(),
+		Config:             config,
+		Prompt:             buildNativePrompt(harness, *prompt, config.Kind == "recurring", workspaceBootstrap),
+		Workspace:          resolvedWorkspace,
+		UI:                 "native",
+		Cwd:                *cwd,
+		Stdout:             *stdout,
+		Stderr:             *stderr,
+		Env:                []string(env),
+		HasRecovery:        !*noRecurringFallback,
+		PrimaryLabel:       primaryLabel(jobName),
+		RecoveryLabel:      recoveryLabel(jobName),
+		OnceLabel:          onceLabel(jobName),
+		OnceRecoveryLabel:  onceRecoveryLabel(jobName),
+		WorkspaceBootstrap: workspaceBootstrap,
 	}
 	return m.installAndStore(record)
+}
+
+func nativeHarnessHelp(harness activity.Harness) string {
+	return strings.TrimSpace(fmt.Sprintf(`
+declaw schedule %s
+
+Create a scheduled %s run using its native command line interface.
+
+Usage:
+  declaw schedule %s <job> --prompt <text> --project <name> [recurring schedule flags]
+  declaw schedule %s <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
+
+The native %s command is used directly. Recurring schedules require --project; one-off schedules may use --workspace or the default one-off workspace.
+`, harness, providerDisplayName(string(harness)), harness, harness, providerDisplayName(string(harness))))
+}
+
+func buildNativePrompt(harness activity.Harness, prompt string, recurring, workspaceRoot bool) string {
+	parts := []string{fmt.Sprintf("You are running as a scheduled %s job.", providerDisplayName(string(harness)))}
+	if workspaceRoot {
+		parts = append(parts, workspaceCodexPromptPrefix)
+	}
+	parts = append(parts, scheduledCodexLocalToolPrefix)
+	parts = append(parts, scheduledCompletionInstruction)
+	parts = append(parts, scheduledCodexChatHandoff)
+	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + strings.TrimSpace(prompt)
+}
+
+func (m *Manager) create(args []string) (string, error) {
+	if hasHelpArg(args) {
+		return m.createHelp(), nil
+	}
+
+	provider := ""
+	harnessAlias := ""
+	projectName := ""
+	forwarded := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		setValue := func(target *string) error {
+			if index+1 >= len(args) {
+				return fmt.Errorf("%s requires a value", arg)
+			}
+			*target = args[index+1]
+			index++
+			return nil
+		}
+		switch {
+		case arg == "--provider":
+			if err := setValue(&provider); err != nil {
+				return "", err
+			}
+		case strings.HasPrefix(arg, "--provider="):
+			provider = strings.TrimPrefix(arg, "--provider=")
+		case arg == "--harness":
+			if err := setValue(&harnessAlias); err != nil {
+				return "", err
+			}
+		case strings.HasPrefix(arg, "--harness="):
+			harnessAlias = strings.TrimPrefix(arg, "--harness=")
+		case arg == "--project":
+			if err := setValue(&projectName); err != nil {
+				return "", err
+			}
+			forwarded = append(forwarded, "--project", projectName)
+		case strings.HasPrefix(arg, "--project="):
+			projectName = strings.TrimPrefix(arg, "--project=")
+			forwarded = append(forwarded, arg)
+		default:
+			forwarded = append(forwarded, arg)
+		}
+	}
+	if strings.TrimSpace(provider) != "" && strings.TrimSpace(harnessAlias) != "" && normalizeProvider(provider) != normalizeProvider(harnessAlias) {
+		return "", errors.New("--provider and --harness cannot disagree")
+	}
+	selection := provider
+	if strings.TrimSpace(selection) == "" {
+		selection = harnessAlias
+	}
+	if strings.TrimSpace(selection) == "" {
+		return "", errors.New("--provider or --harness is required for declaw schedule create. Valid values: pi, hermes, codex, claude, default.")
+	}
+
+	resolvedProvider, err := m.resolveCreateProvider(selection, projectName)
+	if err != nil {
+		return "", err
+	}
+
+	switch resolvedProvider {
+	case "codex":
+		return m.scheduleCodex(forwarded)
+	case "claude":
+		return m.scheduleClaude(forwarded)
+	case "pi":
+		return m.scheduleNativeHarness("pi", forwarded)
+	case "hermes":
+		return m.scheduleNativeHarness("hermes", forwarded)
+	default:
+		return "", fmt.Errorf("unsupported schedule provider %q", resolvedProvider)
+	}
 }
 
 func (m *Manager) edit(args []string) (string, error) {
@@ -668,12 +1045,15 @@ func (m *Manager) edit(args []string) (string, error) {
 	fs.SetOutput(bytes.NewBuffer(nil))
 
 	prompt := fs.String("prompt", "", "prompt")
-	provider := fs.String("provider", "", "agent provider: codex or claude")
-	providerAlias := fs.String("type", "", "agent provider: codex or claude")
+	provider := fs.String("provider", "", "agent harness: pi, hermes, codex, or claude")
+	providerAlias := fs.String("type", "", "agent harness: pi, hermes, codex, or claude")
+	harnessAlias := fs.String("harness", "", "agent harness: pi, hermes, codex, or claude")
 	projectName := fs.String("project", "", "project")
 	workspace := fs.String("workspace", "", "workspace")
 	noWorkspace := fs.Bool("no-workspace", false, "unsupported; recurring Codex schedules require --project")
 	ui := fs.String("ui", "", "scheduled UI")
+	agentColor := fs.String("agent-color", "", "legacy compatibility option")
+	clearAgentColor := fs.Bool("clear-agent-color", false, "clear any stored agent color")
 	daily := fs.String("daily", "", "daily")
 	timeValue := fs.String("time", "", "time")
 	weekdays := fs.String("weekdays", "", "weekdays")
@@ -695,13 +1075,18 @@ func (m *Manager) edit(args []string) (string, error) {
 	if len(rest) != 1 {
 		return "", errors.New("usage: declaw schedule edit <job> [flags]")
 	}
-	if *provider != "" && *providerAlias != "" && normalizeProvider(*provider) != normalizeProvider(*providerAlias) {
-		return "", errors.New("--provider and --type cannot disagree")
+	selections := []string{*provider, *providerAlias, *harnessAlias}
+	selectedProvider := ""
+	for _, selection := range selections {
+		if strings.TrimSpace(selection) == "" {
+			continue
+		}
+		if selectedProvider != "" && normalizeProvider(selectedProvider) != normalizeProvider(selection) {
+			return "", errors.New("--provider, --type, and --harness cannot disagree")
+		}
+		selectedProvider = selection
 	}
-	nextProvider := *provider
-	if nextProvider == "" {
-		nextProvider = *providerAlias
-	}
+	nextProvider := selectedProvider
 
 	store, err := m.loadJobs()
 	if err != nil {
@@ -768,6 +1153,14 @@ func (m *Manager) edit(args []string) (string, error) {
 		} else if providerChanged {
 			record.UI = normalizeCodexUI("")
 		}
+		if *agentColor != "" {
+			if err := validateAgentColorFlag(record.UI, *agentColor); err != nil {
+				return "", err
+			}
+			record.AgentColor = normalizeDeclawAgentColor(*agentColor)
+		} else if *clearAgentColor {
+			record.AgentColor = ""
+		}
 		resolvedWorkspace := record.Workspace
 		workspaceBootstrap := record.WorkspaceBootstrap
 		if *projectName != "" || *workspace != "" || *noWorkspace {
@@ -784,7 +1177,7 @@ func (m *Manager) edit(args []string) (string, error) {
 			if *prompt != "" {
 				taskPrompt = *prompt
 			}
-			record.Prompt = buildCodexPrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap)
+			record.Prompt = buildCodexPrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap, record.UI)
 		}
 	case "claude":
 		if *ui != "" {
@@ -795,6 +1188,14 @@ func (m *Manager) edit(args []string) (string, error) {
 		} else if providerChanged {
 			record.UI = normalizeClaudeUI("")
 		}
+		if *agentColor != "" {
+			if err := validateAgentColorFlag(record.UI, *agentColor); err != nil {
+				return "", err
+			}
+			record.AgentColor = normalizeDeclawAgentColor(*agentColor)
+		} else if *clearAgentColor {
+			record.AgentColor = ""
+		}
 		resolvedWorkspace := record.Workspace
 		workspaceBootstrap := record.WorkspaceBootstrap
 		if *projectName != "" || *workspace != "" || *noWorkspace {
@@ -811,7 +1212,36 @@ func (m *Manager) edit(args []string) (string, error) {
 			if *prompt != "" {
 				taskPrompt = *prompt
 			}
-			record.Prompt = buildClaudePrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap)
+			record.Prompt = buildClaudePrompt(taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap, record.UI)
+		}
+	case "pi", "hermes":
+		if strings.TrimSpace(*ui) != "" && strings.ToLower(strings.TrimSpace(*ui)) != "native" {
+			return "", fmt.Errorf("%s schedules use the native harness command; --ui must be native", nextProvider)
+		}
+		if *agentColor != "" {
+			return "", errors.New("--agent-color is not supported for native harness schedules")
+		}
+		if *clearAgentColor {
+			record.AgentColor = ""
+		}
+		record.UI = "native"
+		resolvedWorkspace := record.Workspace
+		workspaceBootstrap := record.WorkspaceBootstrap
+		if *projectName != "" || *workspace != "" || *noWorkspace {
+			var err error
+			resolvedWorkspace, workspaceBootstrap, err = m.resolveWorkspace(*projectName, *workspace, *noWorkspace, record.Config.Kind)
+			if err != nil {
+				return "", err
+			}
+			record.Workspace = resolvedWorkspace
+			record.WorkspaceBootstrap = workspaceBootstrap
+		}
+		if *prompt != "" || *projectName != "" || *workspace != "" || *noWorkspace || providerChanged {
+			taskPrompt := extractTaskPrompt(record.Prompt)
+			if *prompt != "" {
+				taskPrompt = *prompt
+			}
+			record.Prompt = buildNativePrompt(activity.Harness(nextProvider), taskPrompt, record.Config.Kind == "recurring", workspaceBootstrap)
 		}
 	default:
 		return "", fmt.Errorf("unsupported schedule provider %q", nextProvider)
@@ -900,29 +1330,46 @@ func (m *Manager) help() string {
 	return strings.TrimSpace(`
 declaw schedule
 
-Manage native macOS launchd schedules for Codex and Claude runs.
+Manage native macOS launchd schedules for Pi, Hermes, Codex, and Claude runs.
 
 Commands:
   declaw schedule list
   declaw schedule status <job>
   declaw schedule enable <job>
   declaw schedule disable <job>
+  declaw schedule pause <job>
+  declaw schedule resume <job>
   declaw schedule restart <job>
   declaw schedule run <job>
+  declaw schedule ready
+  declaw schedule complete [--summary <text>]
   declaw schedule remove <job>
   declaw schedule remove-all
   declaw schedule prune-once
   declaw schedule get-prompt <job>
   declaw schedule get-time <job>
+  declaw schedule pi <job> --prompt <text> --project <name> [recurring schedule flags]
+  declaw schedule pi <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
+  declaw schedule hermes <job> --prompt <text> --project <name> [recurring schedule flags]
+  declaw schedule hermes <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
   declaw schedule codex <job> --prompt <text> --project <name> [recurring schedule flags]
   declaw schedule codex <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
   declaw schedule claude <job> --prompt <text> --project <name> [recurring schedule flags]
   declaw schedule claude <job> --prompt <text> [--project <name> | --workspace <dir>] --at "YYYY-MM-DD HH:MM"
-  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--provider codex|claude]
+  declaw schedule create <job> --provider [pi|hermes|codex|claude|default] --prompt <text> [provider schedule flags]
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--provider <harness>]
 
 Agent schedule context:
-  Recurring Codex and Claude schedules require a declaw project. Use declaw track <name> --path <dir> for an existing directory, or declaw create <name> for a fresh workspace. One-off schedules may use --project, --workspace, or omit both to use declaw's default one-off workspace.
+  Recurring schedules require a declaw project. Use declaw track <name> --path <dir> for an existing directory, or declaw create <name> for a fresh empty project. One-off schedules may use --project, --workspace, or omit both to use declaw's default one-off workspace.
   In scheduled chat follow-ups, Enter sends, Ctrl+J inserts a line break, and long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
+
+Choosing a harness:
+  Use declaw schedule pi, hermes, codex, or claude when the harness is explicit.
+  Use declaw schedule create with --provider default to resolve through the project harness first, then declaw settings.
+  The pi and hermes subcommands always use their native command line interfaces.
+
+Scheduled terminal:
+  Scheduled interactive jobs open Terminal by default. Use declaw settings terminal ghostty to open them in Ghostty instead.
 
 Schedule flags:
   --daily HH:MM
@@ -933,10 +1380,37 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
-  --provider codex|claude            For edit: switch an existing agent schedule between Codex and Claude.
-  --ui app-server|declaw|codex       app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
-  --ui claude|declaw|print           For Claude schedules: claude opens the raw Claude TUI; declaw uses declaw's chat UI; print runs headless with claude -p.
+  --provider pi|hermes|codex|claude  For edit: switch an existing agent schedule.
   --no-recurring-fallback
+
+Scheduled completion:
+  Scheduled prompts instruct the agent to run declaw schedule complete after successful completion.
+  One-off schedules keep an optional fallback twin installed until completion is marked.
+
+Raw UI readiness:
+  Existing native terminal schedules retain their readiness check before a configured terminal opens.
+`)
+}
+
+func (m *Manager) createHelp() string {
+	return strings.TrimSpace(`
+declaw schedule create
+
+Create a scheduled agent run by resolving a provider first, then forwarding to the provider-specific scheduler.
+
+Usage:
+  declaw schedule create <job> --provider [pi|hermes|codex|claude|default] --prompt <text> [schedule flags]
+
+Provider resolution:
+  pi         Create a Pi schedule immediately.
+  hermes     Create a Hermes schedule immediately.
+  codex      Create a Codex schedule immediately.
+  claude     Create a Claude schedule immediately.
+  default    Resolve using the tracked project's harness override first, then declaw settings.
+
+Examples:
+  declaw schedule create repo-review --provider default --project product-repo --daily 10:00 --prompt "Review this repo and summarize risks."
+  declaw schedule create pm-review --provider pi --project pm-workspace --weekdays 09:00 --prompt "Review PM deadlines."
 `)
 }
 
@@ -953,7 +1427,7 @@ Usage:
 Choose the target:
   --project <name>      Use a declaw-tracked project from declaw list.
   --workspace <dir>     Use an existing directory directly. Allowed only for one-off jobs.
-  omitted               Allowed only for one-off jobs; uses ~/.local/share/declaw/workspaces/one-off.
+  omitted               Allowed only for one-off jobs; uses ~/Library/Application Support/declaw/support/workspaces/one-off.
 
 Scheduled chat follow-ups:
   Enter sends. Ctrl+J inserts a line break. Long bracketed pastes are summarized in the visible input as [pasted N characters] while the full pasted text is still sent.
@@ -977,7 +1451,6 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
-  --ui app-server|declaw|codex       app-server is the default clean chat UI; declaw uses the legacy codex exec UI; codex opens the raw Codex TUI.
   --no-recurring-fallback
 `)
 }
@@ -988,7 +1461,7 @@ declaw schedule claude
 
 Create a scheduled Claude Code run. Recurring jobs require a declaw project so Claude gets durable managed context. One-off jobs may omit it and use declaw's default one-off workspace.
 
-Claude schedules run with full Claude Code permissions by passing --dangerously-skip-permissions. Use this only for directories you trust.
+Claude schedules run with full Claude Code permissions by passing --dangerously-skip-permissions and --permission-mode bypassPermissions. Use this only for directories you trust.
 
 Usage:
   declaw schedule claude <job> --prompt <text> --project <name> [recurring schedule flags]
@@ -997,7 +1470,7 @@ Usage:
 Choose the target:
   --project <name>      Use a declaw-tracked project from declaw list.
   --workspace <dir>     Use an existing directory directly. Allowed only for one-off jobs.
-  omitted               Allowed only for one-off jobs; uses ~/.local/share/declaw/workspaces/one-off.
+  omitted               Allowed only for one-off jobs; uses ~/Library/Application Support/declaw/support/workspaces/one-off.
 
 Examples:
   declaw schedule claude pm-review --project pm-workspace --weekdays 09:00 --prompt "Review PM deadlines, project risks, and codebase signals."
@@ -1013,7 +1486,6 @@ Schedule flags:
   --once                         Make explicit --year/--month/--day fields one-off.
   --year YYYY --month M --day D --hour H --minute M [--weekday mon]
   --cwd <dir> --stdout <path> --stderr <path> --env KEY=VALUE
-  --ui claude|declaw|print       claude opens the raw Claude TUI; declaw uses declaw's chat UI; print runs headless with claude -p.
   --no-recurring-fallback
 `)
 }
@@ -1025,9 +1497,9 @@ declaw schedule edit
 Edit an existing schedule while preserving unspecified fields.
 
 Usage:
-  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--provider codex|claude]
+  declaw schedule edit <job> [schedule flags] [--prompt <text>] [--project <name>] [--provider <harness>]
 
-Use --provider codex or --provider claude to switch an existing agent schedule while preserving the task prompt, timing, and workspace. If --ui is omitted during a provider switch, declaw uses the new provider's default UI.
+Use --provider pi, hermes, codex, or claude to switch an existing agent schedule while preserving the task prompt, timing, and workspace.
 
 For recurring agent jobs, switching context requires --project. For one-off agent jobs, --workspace is also allowed.
 `)
@@ -1050,18 +1522,57 @@ func normalizeProvider(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+func normalizeCreateProvider(value string) string {
+	return normalizeProvider(value)
+}
+
 func validateProvider(value string) error {
 	switch normalizeProvider(value) {
-	case "codex", "claude":
+	case "pi", "hermes", "codex", "claude":
 		return nil
 	default:
-		return fmt.Errorf("--provider must be codex or claude, got %q", value)
+		return fmt.Errorf("--provider must be pi, hermes, codex, or claude, got %q", value)
 	}
+}
+
+func validateCreateProvider(value string) error {
+	switch normalizeCreateProvider(value) {
+	case "pi", "hermes", "codex", "claude", "default":
+		return nil
+	default:
+		return fmt.Errorf("--provider must be pi, hermes, codex, claude, or default, got %q", value)
+	}
+}
+
+func (m *Manager) resolveCreateProvider(value, projectName string) (string, error) {
+	provider := normalizeCreateProvider(value)
+	if err := validateCreateProvider(provider); err != nil {
+		return "", err
+	}
+	if provider != "default" {
+		return provider, nil
+	}
+	if strings.TrimSpace(projectName) != "" {
+		project, err := m.projects.Get(projectName)
+		if err != nil {
+			return "", err
+		}
+		if project.Harness != "" {
+			return project.Harness, nil
+		}
+		if project.Provider != "" {
+			return project.Provider, nil
+		}
+	}
+	if m.settings == nil {
+		return settings.DefaultProvider, nil
+	}
+	return m.settings.DefaultProvider()
 }
 
 func normalizeCodexUI(value string) string {
 	if strings.TrimSpace(value) == "" {
-		return "app-server"
+		return settings.DefaultCodexUI
 	}
 	return strings.ToLower(strings.TrimSpace(value))
 }
@@ -1075,13 +1586,18 @@ func validateCodexUI(value string) error {
 	case "app-server", "declaw", "codex":
 		return nil
 	default:
-		return fmt.Errorf("--ui must be app-server, declaw, or codex, got %q", value)
+		switch normalizeCodexUI(value) {
+		case "claude", "print":
+			return fmt.Errorf("invalid --ui %q for Codex schedules; %q belongs to `declaw schedule claude`. Valid Codex values: app-server, declaw, codex. See `declaw schedule codex -h`", value, normalizeCodexUI(value))
+		default:
+			return fmt.Errorf("invalid --ui %q for Codex schedules; valid values: app-server, declaw, codex. See `declaw schedule codex -h`", value)
+		}
 	}
 }
 
 func normalizeClaudeUI(value string) string {
 	if strings.TrimSpace(value) == "" {
-		return "claude"
+		return settings.DefaultClaudeUI
 	}
 	return strings.ToLower(strings.TrimSpace(value))
 }
@@ -1090,13 +1606,112 @@ func effectiveClaudeUI(value string) string {
 	return normalizeClaudeUI(value)
 }
 
+func (m *Manager) defaultScheduledTerminal() (string, error) {
+	if m.settings == nil {
+		return settings.DefaultTerminal, nil
+	}
+	return m.settings.DefaultTerminal()
+}
+
+func (m *Manager) scheduledTerminalCommand(scriptPath string) (string, string, []string, error) {
+	terminal, err := m.defaultScheduledTerminal()
+	if err != nil {
+		return "", "", nil, err
+	}
+	program, args, err := scheduledTerminalCommand(terminal, scriptPath)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return terminal, program, args, nil
+}
+
+func scheduledTerminalCommand(terminal, scriptPath string) (string, []string, error) {
+	terminal = strings.ToLower(strings.TrimSpace(terminal))
+	if terminal == "" {
+		terminal = settings.DefaultTerminal
+	}
+	if err := settings.ValidateTerminal(terminal); err != nil {
+		return "", nil, err
+	}
+
+	switch terminal {
+	case "terminal":
+		return "/usr/bin/open", []string{"-a", "Terminal", scriptPath}, nil
+	case "ghostty":
+		return "/usr/bin/open", []string{"-na", "Ghostty", "--args", "-e", "/bin/zsh", scriptPath}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported scheduled terminal %q", terminal)
+	}
+}
+
+func scheduledTerminalDisplayName(terminal string) string {
+	if strings.EqualFold(strings.TrimSpace(terminal), "ghostty") {
+		return "Ghostty"
+	}
+	return "Terminal"
+}
+
 func validateClaudeUI(value string) error {
 	switch normalizeClaudeUI(value) {
 	case "claude", "declaw", "print":
 		return nil
 	default:
-		return fmt.Errorf("--ui must be claude, declaw, or print for Claude schedules, got %q", value)
+		switch normalizeClaudeUI(value) {
+		case "app-server", "codex":
+			return fmt.Errorf("invalid --ui %q for Claude schedules; %q belongs to `declaw schedule codex`. Valid Claude values: claude, declaw, print. See `declaw schedule claude -h`", value, normalizeClaudeUI(value))
+		default:
+			return fmt.Errorf("invalid --ui %q for Claude schedules; valid values: claude, declaw, print. See `declaw schedule claude -h`", value)
+		}
 	}
+}
+
+func normalizeDeclawAgentColor(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func effectiveDeclawAgentColor(value string) string {
+	if normalizeDeclawAgentColor(value) == "" {
+		return defaultDeclawAgentColor
+	}
+	return normalizeDeclawAgentColor(value)
+}
+
+func validateDeclawAgentColor(value string) error {
+	color := normalizeDeclawAgentColor(value)
+	for _, option := range declawAgentColors {
+		if option.Name == color {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid --agent-color %q. Run `declaw schedule colors` for valid options", value)
+}
+
+func validateAgentColorFlag(ui, color string) error {
+	if strings.TrimSpace(color) == "" {
+		return nil
+	}
+	if strings.ToLower(strings.TrimSpace(ui)) != "declaw" {
+		return errors.New("--agent-color only applies to --ui declaw")
+	}
+	return validateDeclawAgentColor(color)
+}
+
+func declawColorsHelp() string {
+	lines := []string{
+		"declaw schedule colors",
+		"",
+		"Available agent colors for `--ui declaw`:",
+	}
+	for _, option := range declawAgentColors {
+		label := option.Name
+		if option.Name == defaultDeclawAgentColor {
+			label += " (default)"
+		}
+		lines = append(lines, "  "+colorize(label, option.ANSI))
+	}
+	lines = append(lines, "", "Usage: declaw schedule codex <job> --ui declaw --agent-color <name> ...")
+	lines = append(lines, "       declaw schedule claude <job> --ui declaw --agent-color <name> ...")
+	return strings.Join(lines, "\n")
 }
 
 func validateWorkspaceDir(path string) error {
@@ -1126,41 +1741,48 @@ func (m *Manager) installAndStore(record JobRecord) (string, error) {
 }
 
 func (m *Manager) installRecord(record JobRecord) error {
-	if record.Type != "codex" && record.Type != "claude" {
+	if !isSupportedScheduleHarness(record.Type) {
 		return fmt.Errorf("unsupported schedule type %q", record.Type)
 	}
-	if record.Type == "codex" || record.Type == "claude" {
-		if err := m.writePromptFile(record); err != nil {
-			return err
-		}
+	if err := m.writePromptFile(record); err != nil {
+		return err
 	}
 
 	if record.Config.Kind == "once" {
-		payload := m.buildPlist(record.OnceLabel, m.onceProgramArguments(record), record, nil)
-		return m.installJob(record.OnceLabel, payload)
+		payload := m.buildPlist(record.OnceLabel, m.onceProgramArguments(record, "scheduled"), record, nil)
+		if err := m.installJob(record.OnceLabel, payload, record.Paused); err != nil {
+			return err
+		}
+		if !record.HasRecovery {
+			return nil
+		}
+		recoveryPayload := m.buildPlist(record.OnceRecoveryLabel, m.onceProgramArguments(record, "recovery"), record, onceRecoveryCalendarEntries(record.Config))
+		return m.installJob(record.OnceRecoveryLabel, recoveryPayload, record.Paused)
 	}
 
 	primaryPayload := m.buildPlist(record.PrimaryLabel, m.recurringProgramArguments(record, "scheduled"), record, nil)
-	if err := m.installJob(record.PrimaryLabel, primaryPayload); err != nil {
+	if err := m.installJob(record.PrimaryLabel, primaryPayload, record.Paused); err != nil {
 		return err
 	}
 	if !record.HasRecovery {
 		return nil
 	}
 	recoveryPayload := m.buildPlist(record.RecoveryLabel, m.recurringProgramArguments(record, "recovery"), record, recoveryCalendarEntries(record.Config))
-	return m.installJob(record.RecoveryLabel, recoveryPayload)
+	return m.installJob(record.RecoveryLabel, recoveryPayload, record.Paused)
 }
 
-func (m *Manager) installJob(label string, payload map[string]any) error {
+func (m *Manager) installJob(label string, payload map[string]any, paused bool) error {
 	if err := os.WriteFile(m.installedPlistPath(label), buildPlistXML(payload), 0o644); err != nil {
 		return err
 	}
 	_ = m.bootout(label)
-	_ = m.enableLabel(label)
+	if !paused {
+		_ = m.enableLabel(label)
+	}
 	if err := m.bootstrap(label); err != nil {
 		return err
 	}
-	return m.enableLabel(label)
+	return m.applyInstalledLabelState(label, paused)
 }
 
 func (m *Manager) recurringProgramArguments(record JobRecord, trigger string) []string {
@@ -1187,15 +1809,16 @@ func (m *Manager) recurringProgramArguments(record JobRecord, trigger string) []
 	return args
 }
 
-func (m *Manager) onceProgramArguments(record JobRecord) []string {
+func (m *Manager) onceProgramArguments(record JobRecord, triggerKind string) []string {
 	args := []string{
 		m.executablePath,
 		"schedule",
 		"__internal",
 		"run-once",
 		"--job", record.Name,
-		"--cleanup-label", record.OnceLabel,
+		"--trigger-kind", triggerKind,
 		"--type", record.Type,
+		"--scheduled-time", onceScheduledAt(record.Config).Format(time.RFC3339),
 	}
 	args = append(args, m.jobPayloadArgs(record)...)
 	return args
@@ -1216,6 +1839,15 @@ func (m *Manager) jobPayloadArgs(record JobRecord) []string {
 			args = append(args, "--workspace", record.Workspace)
 		}
 		args = append(args, "--ui", effectiveClaudeUI(record.UI))
+	case "pi", "hermes":
+		args = append(args, "--prompt-file", m.promptPath(record.Name))
+		if record.Workspace != "" {
+			args = append(args, "--workspace", record.Workspace)
+		}
+		args = append(args, "--ui", "native")
+	}
+	if record.AgentColor != "" {
+		args = append(args, "--agent-color", record.AgentColor)
 	}
 	return args
 }
@@ -1234,12 +1866,13 @@ func (m *Manager) runRecurringInternal(args []string) error {
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
 	ui := fs.String("ui", "", "ui")
+	agentColor := fs.String("agent-color", "", "agent color")
 	weekday := stringListFlag{}
 	fs.Var(&weekday, "weekday", "weekday")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalRecurringValueFlags())); err != nil {
 		return err
 	}
-	if *jobType == "codex" || *jobType == "claude" {
+	if isSupportedScheduleHarness(*jobType) {
 		resolvedPrompt, err := resolveRuntimePrompt(*prompt, *promptFile)
 		if err != nil {
 			return err
@@ -1294,6 +1927,8 @@ func (m *Manager) runRecurringInternal(args []string) error {
 		command = m.codexLaunchCommand(*prompt, *workspace, *jobName, *ui)
 	case "claude":
 		command = m.claudeLaunchCommand(*prompt, *workspace, *jobName, *ui)
+	case "pi", "hermes":
+		command = m.nativeLaunchCommand(*jobType, *prompt, *workspace, *jobName)
 	default:
 		return fmt.Errorf("unknown recurring job type %q", *jobType)
 	}
@@ -1328,7 +1963,7 @@ func (m *Manager) runRecurringInternal(args []string) error {
 		return err
 	}
 
-	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, runtimeEnv(*jobName, *triggerKind, runDir, *scheduledTime))
+	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, runtimeEnv(*jobName, *triggerKind, runDir, *scheduledTime), *agentColor)
 	finishedAt := time.Now().In(time.Local)
 	return appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -1341,16 +1976,18 @@ func (m *Manager) runOnceInternal(args []string) error {
 	fs.SetOutput(bytes.NewBuffer(nil))
 
 	jobName := fs.String("job", "", "job")
-	cleanupLabel := fs.String("cleanup-label", "", "label")
+	triggerKind := fs.String("trigger-kind", "scheduled", "trigger")
 	jobType := fs.String("type", "", "type")
+	scheduledTime := fs.String("scheduled-time", "", "scheduled time")
 	prompt := fs.String("prompt", "", "prompt")
 	promptFile := fs.String("prompt-file", "", "prompt file")
 	workspace := fs.String("workspace", "", "workspace")
 	ui := fs.String("ui", "", "ui")
+	agentColor := fs.String("agent-color", "", "agent color")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, internalOnceValueFlags())); err != nil {
 		return err
 	}
-	if *jobType == "codex" || *jobType == "claude" {
+	if isSupportedScheduleHarness(*jobType) {
 		resolvedPrompt, err := resolveRuntimePrompt(*prompt, *promptFile)
 		if err != nil {
 			return err
@@ -1359,9 +1996,13 @@ func (m *Manager) runOnceInternal(args []string) error {
 	}
 
 	now := time.Now().In(time.Local)
-	runDir := filepath.Join(m.runsDir, "once", sanitizeName(*jobName), now.Format("2006-01-02-150405"))
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	slotRoot := filepath.Join(m.runsDir, "once", sanitizeName(*jobName), onceSlotKey(*scheduledTime))
+	attemptDir := filepath.Join(slotRoot, *triggerKind+"-"+now.Format("2006-01-02-150405"))
+	if err := os.MkdirAll(attemptDir, 0o755); err != nil {
 		return err
+	}
+	if *triggerKind == "recovery" && runCompleted(slotRoot) {
+		return m.cleanupOnceByJobName(*jobName)
 	}
 
 	command := []string{}
@@ -1370,14 +2011,18 @@ func (m *Manager) runOnceInternal(args []string) error {
 		command = m.codexLaunchCommand(*prompt, *workspace, *jobName, *ui)
 	case "claude":
 		command = m.claudeLaunchCommand(*prompt, *workspace, *jobName, *ui)
+	case "pi", "hermes":
+		command = m.nativeLaunchCommand(*jobType, *prompt, *workspace, *jobName)
 	default:
 		return fmt.Errorf("unknown one-off job type %q", *jobType)
 	}
 
-	runMD := filepath.Join(runDir, "run.md")
+	runMD := filepath.Join(attemptDir, "run.md")
 	if err := os.WriteFile(runMD, []byte(strings.Join([]string{
 		fmt.Sprintf("# %s One-Off Run", sanitizeName(*jobName)),
 		"",
+		fmt.Sprintf("- Trigger kind: %s", *triggerKind),
+		fmt.Sprintf("- Scheduled time: %s", *scheduledTime),
 		fmt.Sprintf("- Fired at: %s", now.Format("2006-01-02 15:04:05 MST")),
 		fmt.Sprintf("- Command: %s", strings.Join(command, " ")),
 		"",
@@ -1387,11 +2032,13 @@ func (m *Manager) runOnceInternal(args []string) error {
 		return err
 	}
 
-	env := runtimeEnv(*jobName, "one-off", runDir, "")
+	env := runtimeEnv(*jobName, "one-off-"+*triggerKind, attemptDir, *scheduledTime)
+	env["DECLAW_RUN_ROOT"] = slotRoot
+	env["AGENT_SCHEDULER_RUN_ROOT"] = slotRoot
 	if *jobType == "codex" && m.isDefaultOnceWorkspace(*workspace) {
 		env["DECLAW_CODEX_STATELESS"] = "1"
 	}
-	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, env)
+	exitCode := m.runRuntimeCommand(*jobType, *jobName, *prompt, *workspace, *ui, env, *agentColor)
 	finishedAt := time.Now().In(time.Local)
 	if err := appendLines(runMD,
 		fmt.Sprintf("- Exit code: %d", exitCode),
@@ -1401,25 +2048,39 @@ func (m *Manager) runOnceInternal(args []string) error {
 	); err != nil {
 		return err
 	}
-
-	if err := m.cleanupOnceJob(*cleanupLabel); err != nil {
-		_ = appendLines(runMD, fmt.Sprintf("- Cleanup error: %s", err))
-		return err
+	if runCompleted(slotRoot) {
+		if err := m.cleanupOnceByJobName(*jobName); err != nil {
+			_ = appendLines(runMD, fmt.Sprintf("- Cleanup error: %s", err))
+			return err
+		}
+		return appendLines(runMD, fmt.Sprintf("- Removed one-off job: %s", sanitizeName(*jobName)))
 	}
-	return appendLines(runMD, fmt.Sprintf("- Removed label: %s", *cleanupLabel))
+	if *triggerKind == "recovery" {
+		return appendLines(runMD, "- Completion marker missing after recovery attempt; leaving job installed for inspection.")
+	}
+	return appendLines(runMD, "- Waiting for completion marker or recovery attempt.")
 }
 
-func (m *Manager) cleanupOnceJob(label string) error {
+func (m *Manager) cleanupOnceByJobName(name string) error {
 	store, err := m.loadJobs()
 	if err != nil {
 		return err
 	}
-	delete(store.Jobs, sanitizeName(labelName(label)))
-	m.removePromptFile(labelName(label))
-	if err := m.saveJobs(store); err != nil {
-		return err
+	job, ok := store.Jobs[sanitizeName(name)]
+	if !ok || job.Config.Kind != "once" {
+		return nil
 	}
-	if err := m.uninstallLabel(label); err != nil {
+	for _, label := range labelsForJob(job) {
+		if label == "" {
+			continue
+		}
+		if err := m.uninstallLabel(label); err != nil {
+			return err
+		}
+	}
+	delete(store.Jobs, sanitizeName(name))
+	m.removePromptFile(name)
+	if err := m.saveJobs(store); err != nil {
 		return err
 	}
 	return nil
@@ -1433,12 +2094,14 @@ func (m *Manager) runCodexInternal(args []string) error {
 	workspace := fs.String("workspace", "", "workspace")
 	jobName := fs.String("job-name", "", "job")
 	ui := fs.String("ui", "app-server", "ui")
+	agentColor := fs.String("agent-color", "", "agent color")
 	deletePromptFile := fs.Bool("delete-prompt-file", false, "delete prompt file")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, map[string]bool{
 		"prompt-file": true,
 		"workspace":   true,
 		"job-name":    true,
 		"ui":          true,
+		"agent-color": true,
 	})); err != nil {
 		return err
 	}
@@ -1454,7 +2117,75 @@ func (m *Manager) runCodexInternal(args []string) error {
 		_ = os.Remove(*promptFile)
 	}
 
-	return runCodexWithUI(string(promptBytes), *workspace, *jobName, *ui, map[string]string{})
+	codexReasoningMode, err := m.settings.CodexReasoningMode()
+	if err != nil {
+		return err
+	}
+	return runCodexWithUI(string(promptBytes), *workspace, *jobName, *ui, map[string]string{}, *agentColor, codexReasoningMode)
+}
+
+func (m *Manager) RunInteractiveSession(provider, workspace, jobName, prompt, ui, agentColor, codexReasoningMode string) error {
+	switch normalizeProvider(provider) {
+	case "pi", "hermes":
+		program, args, err := activity.CommandForHarness(activity.Harness(normalizeProvider(provider)), prompt)
+		if err != nil {
+			return err
+		}
+		cmd := exec.Command(program, args...)
+		if workspace != "" {
+			cmd.Dir = workspace
+		}
+		cmd.Env = os.Environ()
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	case "codex":
+		switch effectiveCodexUI(ui) {
+		case "codex":
+			if strings.TrimSpace(prompt) == "" {
+				program := "codex"
+				args := codexDefaultArgs(codexReasoningMode)
+				cmd := exec.Command(program, args...)
+				if workspace != "" {
+					cmd.Dir = workspace
+				}
+				cmd.Env = os.Environ()
+				cmd.Stdin = os.Stdin
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				return cmd.Run()
+			}
+			return runCodexDirect(prompt, workspace, jobName, map[string]string{}, codexReasoningMode)
+		case "declaw", "app-server":
+			return runCodexWithUI(prompt, workspace, jobName, ui, map[string]string{}, agentColor, codexReasoningMode)
+		default:
+			return fmt.Errorf("unknown Codex UI %q", ui)
+		}
+	case "claude":
+		switch effectiveClaudeUI(ui) {
+		case "claude":
+			if strings.TrimSpace(prompt) == "" {
+				args := []string{"--dangerously-skip-permissions", "--permission-mode", "bypassPermissions"}
+				cmd := exec.Command("claude", args...)
+				if workspace != "" {
+					cmd.Dir = workspace
+				}
+				cmd.Env = os.Environ()
+				cmd.Stdin = os.Stdin
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				return cmd.Run()
+			}
+			return runClaudeDirect(prompt, workspace, jobName, map[string]string{})
+		case "declaw", "print":
+			return runClaudeWithUI(prompt, workspace, jobName, ui, map[string]string{}, agentColor)
+		default:
+			return fmt.Errorf("unknown Claude UI %q", ui)
+		}
+	default:
+		return fmt.Errorf("unsupported schedule provider %q", provider)
+	}
 }
 
 func (m *Manager) runClaudeInternal(args []string) error {
@@ -1465,12 +2196,14 @@ func (m *Manager) runClaudeInternal(args []string) error {
 	workspace := fs.String("workspace", "", "workspace")
 	jobName := fs.String("job-name", "", "job")
 	ui := fs.String("ui", "claude", "ui")
+	agentColor := fs.String("agent-color", "", "agent color")
 	deletePromptFile := fs.Bool("delete-prompt-file", false, "delete prompt file")
 	if err := fs.Parse(cliargs.ReorderForFlagSet(args, map[string]bool{
 		"prompt-file": true,
 		"workspace":   true,
 		"job-name":    true,
 		"ui":          true,
+		"agent-color": true,
 	})); err != nil {
 		return err
 	}
@@ -1486,25 +2219,135 @@ func (m *Manager) runClaudeInternal(args []string) error {
 		_ = os.Remove(*promptFile)
 	}
 
-	return runClaudeWithUI(string(promptBytes), *workspace, *jobName, *ui, map[string]string{})
+	return runClaudeWithUI(string(promptBytes), *workspace, *jobName, *ui, map[string]string{}, *agentColor)
 }
 
-func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace, ui string, env map[string]string) int {
+func (m *Manager) runRuntimeCommand(jobType, jobName, prompt, workspace, ui string, env map[string]string, agentColor string) int {
+	if m.projects != nil && strings.TrimSpace(workspace) != "" {
+		_ = m.projects.RecordActivityAtPath(workspace, jobType, time.Now().UTC(), "declaw schedule")
+	}
+	if rawUIScheduledRun(jobType, ui, env) {
+		if err := m.waitForRawUIReadiness(jobType, workspace, env); err != nil {
+			fmt.Fprintf(os.Stderr, "%s readiness probe failed: %s\n", jobType, err)
+			return 1
+		}
+	}
 	switch jobType {
 	case "codex":
-		if err := m.launchCodex(prompt, workspace, jobName, ui, env); err != nil {
+		if err := m.launchCodex(prompt, workspace, jobName, ui, env, agentColor); err != nil {
 			fmt.Fprintf(os.Stderr, "codex run failed: %s\n", err)
 			return 1
 		}
 		return 0
 	case "claude":
-		if err := m.launchClaude(prompt, workspace, jobName, ui, env); err != nil {
+		if err := m.launchClaude(prompt, workspace, jobName, ui, env, agentColor); err != nil {
 			fmt.Fprintf(os.Stderr, "claude run failed: %s\n", err)
+			return 1
+		}
+		return 0
+	case "pi", "hermes":
+		if err := m.launchNativeHarness(jobType, prompt, workspace, jobName, env); err != nil {
+			fmt.Fprintf(os.Stderr, "%s run failed: %s\n", jobType, err)
 			return 1
 		}
 		return 0
 	default:
 		return 1
+	}
+}
+
+func (m *Manager) launchNativeHarness(harnessName, prompt, workspace, jobName string, extraEnv map[string]string) error {
+	program, args, err := activity.CommandForHarness(activity.Harness(harnessName), prompt)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(program, args...)
+	if workspace != "" {
+		cmd.Dir = workspace
+	}
+	cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if strings.TrimSpace(jobName) != "" {
+		fmt.Printf("Running scheduled %s job: %s\n", providerDisplayName(harnessName), jobName)
+	}
+	return cmd.Run()
+}
+
+func rawUIScheduledRun(jobType, ui string, env map[string]string) bool {
+	if strings.TrimSpace(envValue(env, "DECLAW_RUN_DIR")) == "" {
+		return false
+	}
+	switch jobType {
+	case "codex":
+		return effectiveCodexUI(ui) == "codex"
+	case "claude":
+		return effectiveClaudeUI(ui) == "claude"
+	default:
+		return false
+	}
+}
+
+func (m *Manager) waitForRawUIReadiness(jobType, workspace string, env map[string]string) error {
+	runDir := envValue(env, "DECLAW_RUN_DIR")
+	if err := os.Remove(readinessPath(runDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	prompt := fmt.Sprintf("This is a scheduled %s readiness probe. Your first and only task is to run `%s schedule ready` using the provided scheduled-run environment. Do not perform the scheduled task. Do not ask a question. After that command succeeds, stop.", providerDisplayName(jobType), m.executablePath)
+	program, args := readinessCommand(jobType, prompt, workspace)
+	ctx, cancel := context.WithTimeout(context.Background(), rawUIReadinessTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, program, args...)
+	if workspace != "" {
+		cmd.Dir = workspace
+	}
+	cmd.Env = mergeEnv(os.Environ(), env)
+	logFile, err := os.OpenFile(filepath.Join(runDir, "readiness-probe.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	ticker := time.NewTicker(rawUIReadinessPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if runReady(runDir) {
+				cancel()
+				_ = cmd.Wait()
+				return nil
+			}
+		case <-ctx.Done():
+			_ = cmd.Wait()
+			if runReady(runDir) {
+				return nil
+			}
+			return fmt.Errorf("no readiness marker after %s; raw UI was not opened", rawUIReadinessTimeout)
+		}
+	}
+}
+
+func readinessCommand(jobType, prompt, workspace string) (string, []string) {
+	switch jobType {
+	case "codex":
+		args := []string{"exec", "--json", "--skip-git-repo-check"}
+		if workspace != "" {
+			args = append(args, "-C", workspace)
+		}
+		return "codex", append(args, prompt)
+	case "claude":
+		args := append([]string{"-p"}, claudePermissionArgs()...)
+		return "claude", append(args, prompt)
+	default:
+		return jobType, []string{prompt}
 	}
 }
 
@@ -1538,15 +2381,19 @@ func (m *Manager) launchCodexInteractive(prompt, workspace, jobName string, extr
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		return err
 	}
+	terminal, program, args, err := m.scheduledTerminalCommand(scriptPath)
+	if err != nil {
+		return err
+	}
 
 	if jobName != "" {
-		fmt.Printf("Opening scheduled Codex job in Terminal: %s\n", jobName)
+		fmt.Printf("Opening scheduled Codex job in %s: %s\n", scheduledTerminalDisplayName(terminal), jobName)
 	}
 	if workspace != "" {
 		fmt.Printf("Workspace: %s\n\n", workspace)
 	}
 
-	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", scriptPath)
+	cmd := exec.Command(program, args...)
 	cmd.Env = mergeEnv(os.Environ(), extraEnv)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1586,12 +2433,12 @@ func (m *Manager) codexTerminalScript(promptPath, workspace, jobName string, ext
 	return b.String()
 }
 
-func runCodexWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+func runCodexWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]string, agentColor string, codexReasoningMode string) error {
 	switch effectiveCodexUI(ui) {
 	case "codex":
-		return runCodexDirect(prompt, workspace, jobName, extraEnv)
+		return runCodexDirect(prompt, workspace, jobName, extraEnv, codexReasoningMode)
 	case "declaw":
-		return runDeclawCodexChat(prompt, workspace, jobName, extraEnv)
+		return runDeclawCodexChat(prompt, workspace, jobName, extraEnv, agentColor)
 	case "app-server":
 		return runCodexAppServerChat(prompt, workspace, jobName, extraEnv)
 	default:
@@ -1599,7 +2446,7 @@ func runCodexWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]s
 	}
 }
 
-func runCodexDirect(prompt, workspace, jobName string, extraEnv map[string]string) error {
+func runCodexDirect(prompt, workspace, jobName string, extraEnv map[string]string, codexReasoningMode string) error {
 	if strings.TrimSpace(prompt) == "" {
 		return errors.New("missing Codex prompt")
 	}
@@ -1607,7 +2454,7 @@ func runCodexDirect(prompt, workspace, jobName string, extraEnv map[string]strin
 		return errors.New("codex command not found in PATH")
 	}
 
-	program, args := codexCommand(prompt, workspace)
+	program, args := codexCommandWithReasoning(prompt, workspace, codexReasoningMode)
 
 	if jobName != "" {
 		fmt.Printf("Launching scheduled Codex job: %s\n", jobName)
@@ -1684,14 +2531,11 @@ func (codexDeclawChatRunner) RunTurn(sessionID, prompt, workspace string, extraE
 	return runCodexExecTurn(sessionID, prompt, workspace, extraEnv, stderrPath)
 }
 
-func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
-	return runDeclawProviderChat(prompt, workspace, jobName, extraEnv, codexDeclawChatRunner{})
+func runDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string, agentColor string) error {
+	return runDeclawProviderChat(prompt, workspace, jobName, extraEnv, codexDeclawChatRunner{}, agentColor)
 }
 
-func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[string]string, runner declawChatTurnRunner) error {
-	if strings.TrimSpace(prompt) == "" {
-		return errors.New(runner.MissingPromptError())
-	}
+func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[string]string, runner declawChatTurnRunner, agentColor string) error {
 	if _, err := exec.LookPath(runner.CommandName()); err != nil {
 		return fmt.Errorf("%s command not found in PATH", runner.CommandName())
 	}
@@ -1704,25 +2548,32 @@ func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[strin
 	fmt.Println()
 
 	agentName := declawAgentName(workspace)
-	printRecentDeclawChatHistory(workspace, agentName, declawChatHistoryLimit)
+	printRecentDeclawChatHistory(workspace, agentName, declawChatHistoryLimit, agentColor)
 
-	transcriptPath, err := startDeclawChatTranscript(workspace, jobName, prompt)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not create visible chat transcript: %s\n", err)
-	}
+	transcriptPath := ""
+	sessionID := ""
+	if strings.TrimSpace(prompt) != "" {
+		var err error
+		transcriptPath, err = startDeclawChatTranscript(workspace, jobName, prompt)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not create visible chat transcript: %s\n", err)
+		}
 
-	sessionID, displayMessage, err := runner.RunTurn("", prompt, workspace, extraEnv, logPath)
-	if err != nil {
-		return err
-	}
-	if displayMessage != "" {
-		printDeclawChatMessage(agentName, displayMessage)
-	}
-	if transcriptPath != "" && displayMessage != "" {
-		_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
-	}
-	if sessionID == "" {
-		return fmt.Errorf("%s did not return a resumable session id", runner.ProviderName())
+		displayMessage := ""
+		sessionID, displayMessage, err = runner.RunTurn("", prompt, workspace, extraEnv, logPath)
+		if err != nil {
+			return err
+		}
+		_ = markRunComplete(completionRoot(extraEnv), sanitizeName(jobName), envValue(extraEnv, "DECLAW_TRIGGER_KIND"), runner.ProviderName()+" declaw chat", "")
+		if displayMessage != "" {
+			printDeclawChatMessage(agentName, displayMessage, agentColor)
+		}
+		if transcriptPath != "" && displayMessage != "" {
+			_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
+		}
+		if sessionID == "" {
+			return fmt.Errorf("%s did not return a resumable session id", runner.ProviderName())
+		}
 	}
 
 	for {
@@ -1743,6 +2594,10 @@ func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[strin
 			fmt.Println("bye")
 			return nil
 		case "/raw":
+			if sessionID == "" {
+				fmt.Printf("%s is available after the first message.\n", runner.RawSessionLabel())
+				continue
+			}
 			fmt.Printf("%s: %s\n", runner.RawSessionLabel(), runner.RawSessionCommand(sessionID))
 			fmt.Printf("Raw log: %s\n", logPath)
 			continue
@@ -1760,7 +2615,14 @@ func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[strin
 			continue
 		}
 
-		if transcriptPath != "" {
+		firstMessage := sessionID == ""
+		if transcriptPath == "" && firstMessage {
+			var err error
+			transcriptPath, err = startDeclawChatTranscript(workspace, jobName, message)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not create visible chat transcript: %s\n", err)
+			}
+		} else if transcriptPath != "" {
 			_ = appendDeclawChatMessage(transcriptPath, "User", message)
 		}
 		nextSessionID, displayMessage, err := runner.RunTurn(sessionID, message, workspace, extraEnv, logPath)
@@ -1770,7 +2632,7 @@ func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[strin
 			continue
 		}
 		if displayMessage != "" {
-			printDeclawChatMessage(agentName, displayMessage)
+			printDeclawChatMessage(agentName, displayMessage, agentColor)
 		}
 		if transcriptPath != "" && displayMessage != "" {
 			_ = appendDeclawChatMessage(transcriptPath, agentName, displayMessage)
@@ -1778,11 +2640,20 @@ func runDeclawProviderChat(prompt, workspace, jobName string, extraEnv map[strin
 		if nextSessionID != "" {
 			sessionID = nextSessionID
 		}
+		if firstMessage && sessionID == "" {
+			return fmt.Errorf("%s did not return a resumable session id", runner.ProviderName())
+		}
 	}
 }
 
 func runCodexExecTurn(threadID, prompt, workspace string, extraEnv map[string]string, stderrPath string) (string, string, error) {
-	args := []string{"exec"}
+	reasoningMode := "default"
+	if manager, err := settings.NewManager(); err == nil {
+		if mode, err := manager.CodexReasoningMode(); err == nil {
+			reasoningMode = mode
+		}
+	}
+	args := append([]string{"exec"}, codexExecArgs(reasoningMode)...)
 	if threadID != "" {
 		args = append(args, "resume", "--json", "--skip-git-repo-check")
 		args = append(args, threadID, prompt)
@@ -1885,7 +2756,7 @@ func appendDeclawChatMessage(path, role, message string) error {
 	return appendLines(path, fmt.Sprintf("## %s", role), "", strings.TrimSpace(message), "")
 }
 
-func printRecentDeclawChatHistory(workspace, agentName string, limit int) {
+func printRecentDeclawChatHistory(workspace, agentName string, limit int, agentColor string) {
 	if strings.TrimSpace(workspace) == "" || limit <= 0 {
 		return
 	}
@@ -1905,7 +2776,7 @@ func printRecentDeclawChatHistory(workspace, agentName string, limit int) {
 		}
 		fmt.Println(colorize(filepath.Base(path), ansiDim))
 		for _, message := range messages {
-			printDeclawChatMessage(normalizeTranscriptRole(message.Role, agentName), message.Text)
+			printDeclawChatMessage(normalizeTranscriptRole(message.Role, agentName), message.Text, agentColor)
 		}
 	}
 	fmt.Println(colorize("End recent chat", ansiDim))
@@ -1952,12 +2823,12 @@ func normalizeTranscriptRole(role, agentName string) string {
 	return role
 }
 
-func printDeclawChatMessage(role, message string) {
+func printDeclawChatMessage(role, message, agentColor string) {
 	role = strings.TrimSpace(role)
 	if role == "" {
 		role = "Declaw"
 	}
-	color := ansiGreen
+	color := declawAgentANSI(agentColor)
 	if strings.EqualFold(role, "You") || strings.EqualFold(role, "User") {
 		color = ansiBlue
 		role = "You"
@@ -2023,6 +2894,16 @@ func colorize(value, color string) string {
 	return color + value + ansiReset
 }
 
+func declawAgentANSI(color string) string {
+	name := effectiveDeclawAgentColor(color)
+	for _, option := range declawAgentColors {
+		if option.Name == name {
+			return option.ANSI
+		}
+	}
+	return ansiGreen
+}
+
 func runDeclawSpinner(done <-chan struct{}) {
 	ticker := time.NewTicker(120 * time.Millisecond)
 	defer ticker.Stop()
@@ -2085,12 +2966,12 @@ func looksLikeDeclawProcessNarration(message string) bool {
 	return strings.Contains(lowered, "session log") && strings.Contains(lowered, "workspace")
 }
 
-func (m *Manager) launchCodex(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+func (m *Manager) launchCodex(prompt, workspace, jobName, ui string, extraEnv map[string]string, agentColor string) error {
 	switch effectiveCodexUI(ui) {
 	case "codex":
 		return m.launchCodexInteractive(prompt, workspace, jobName, extraEnv)
 	case "declaw":
-		return m.launchDeclawCodexChat(prompt, workspace, jobName, extraEnv)
+		return m.launchDeclawCodexChat(prompt, workspace, jobName, extraEnv, agentColor)
 	case "app-server":
 		return m.launchAppServerCodexChat(prompt, workspace, jobName, extraEnv)
 	default:
@@ -2098,23 +2979,23 @@ func (m *Manager) launchCodex(prompt, workspace, jobName, ui string, extraEnv ma
 	}
 }
 
-func (m *Manager) launchDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
-	return m.launchCodexChatTerminal(prompt, workspace, jobName, "declaw", extraEnv)
+func (m *Manager) launchDeclawCodexChat(prompt, workspace, jobName string, extraEnv map[string]string, agentColor string) error {
+	return m.launchCodexChatTerminal(prompt, workspace, jobName, "declaw", extraEnv, agentColor)
 }
 
 func (m *Manager) launchAppServerCodexChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
-	return m.launchCodexChatTerminal(prompt, workspace, jobName, "app-server", extraEnv)
+	return m.launchCodexChatTerminal(prompt, workspace, jobName, "app-server", extraEnv, "")
 }
 
-func (m *Manager) launchCodexChatTerminal(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
-	return m.launchAgentChatTerminal("codex", effectiveCodexUI(ui), prompt, workspace, jobName, extraEnv)
+func (m *Manager) launchCodexChatTerminal(prompt, workspace, jobName, ui string, extraEnv map[string]string, agentColor string) error {
+	return m.launchAgentChatTerminal("codex", effectiveCodexUI(ui), prompt, workspace, jobName, extraEnv, agentColor)
 }
 
-func (m *Manager) launchDeclawClaudeChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
-	return m.launchAgentChatTerminal("claude", "declaw", prompt, workspace, jobName, extraEnv)
+func (m *Manager) launchDeclawClaudeChat(prompt, workspace, jobName string, extraEnv map[string]string, agentColor string) error {
+	return m.launchAgentChatTerminal("claude", "declaw", prompt, workspace, jobName, extraEnv, agentColor)
 }
 
-func (m *Manager) launchAgentChatTerminal(provider, ui, prompt, workspace, jobName string, extraEnv map[string]string) error {
+func (m *Manager) launchAgentChatTerminal(provider, ui, prompt, workspace, jobName string, extraEnv map[string]string, agentColor string) error {
 	runDir := extraEnv["DECLAW_RUN_DIR"]
 	if strings.TrimSpace(runDir) == "" {
 		var err error
@@ -2133,26 +3014,30 @@ func (m *Manager) launchAgentChatTerminal(provider, ui, prompt, workspace, jobNa
 	}
 
 	scriptPath := filepath.Join(runDir, "run-"+provider+"-"+ui+"-chat.command")
-	script := m.declawChatTerminalScript(provider, promptPath, workspace, jobName, ui, extraEnv)
+	script := m.declawChatTerminalScript(provider, promptPath, workspace, jobName, ui, extraEnv, agentColor)
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		return err
+	}
+	terminal, program, args, err := m.scheduledTerminalCommand(scriptPath)
+	if err != nil {
 		return err
 	}
 
 	if jobName != "" {
-		fmt.Printf("Opening %s chat for scheduled %s job: %s\n", ui, providerDisplayName(provider), jobName)
+		fmt.Printf("Opening %s chat in %s for scheduled %s job: %s\n", ui, scheduledTerminalDisplayName(terminal), providerDisplayName(provider), jobName)
 	}
 	if workspace != "" {
 		fmt.Printf("Workspace: %s\n\n", workspace)
 	}
 
-	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", scriptPath)
+	cmd := exec.Command(program, args...)
 	cmd.Env = mergeEnv(os.Environ(), extraEnv)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func (m *Manager) declawChatTerminalScript(provider, promptPath, workspace, jobName, ui string, extraEnv map[string]string) string {
+func (m *Manager) declawChatTerminalScript(provider, promptPath, workspace, jobName, ui string, extraEnv map[string]string, agentColor string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/zsh\n")
 	b.WriteString("set -e\n")
@@ -2184,12 +3069,20 @@ func (m *Manager) declawChatTerminalScript(provider, promptPath, workspace, jobN
 	}
 	b.WriteString(" --ui ")
 	b.WriteString(shellQuote(effectiveCodexUI(ui)))
+	if strings.TrimSpace(agentColor) != "" {
+		b.WriteString(" --agent-color ")
+		b.WriteString(shellQuote(agentColor))
+	}
 	b.WriteString("\n")
 	return b.String()
 }
 
 func providerDisplayName(provider string) string {
 	switch provider {
+	case "pi":
+		return "Pi"
+	case "hermes":
+		return "Hermes"
 	case "codex":
 		return "Codex"
 	case "claude":
@@ -2200,7 +3093,11 @@ func providerDisplayName(provider string) string {
 }
 
 func codexCommand(prompt, workspace string) (string, []string) {
-	codexArgs := []string{"--no-alt-screen"}
+	return codexCommandWithReasoning(prompt, workspace, "default")
+}
+
+func codexCommandWithReasoning(prompt, workspace, reasoningMode string) (string, []string) {
+	codexArgs := append(codexDefaultArgs(reasoningMode), "--no-alt-screen")
 	if workspace != "" {
 		codexArgs = append(codexArgs, "-C", workspace)
 	}
@@ -2211,25 +3108,27 @@ func codexCommand(prompt, workspace string) (string, []string) {
 func codexCommandForUI(prompt, workspace, ui string) (string, []string) {
 	switch effectiveCodexUI(ui) {
 	case "declaw":
-		args := []string{"exec", "--json", "--skip-git-repo-check"}
+		args := append([]string{"exec"}, codexExecArgs("default")...)
+		args = append(args, "--json", "--skip-git-repo-check")
 		if workspace != "" {
 			args = append(args, "-C", workspace)
 		}
 		args = append(args, prompt)
 		return "codex", args
 	case "app-server":
-		args := []string{"app-server", "--listen", "stdio://", prompt}
+		args := []string{"app-server"}
+		args = append(args, "--listen", "stdio://", prompt)
 		return "codex", args
 	}
 	return codexCommand(prompt, workspace)
 }
 
-func (m *Manager) launchClaude(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+func (m *Manager) launchClaude(prompt, workspace, jobName, ui string, extraEnv map[string]string, agentColor string) error {
 	switch effectiveClaudeUI(ui) {
 	case "claude":
 		return m.launchClaudeInteractive(prompt, workspace, jobName, extraEnv)
 	case "declaw":
-		return m.launchDeclawClaudeChat(prompt, workspace, jobName, extraEnv)
+		return m.launchDeclawClaudeChat(prompt, workspace, jobName, extraEnv, agentColor)
 	case "print":
 		return runClaudePrint(prompt, workspace, jobName, extraEnv)
 	default:
@@ -2267,15 +3166,19 @@ func (m *Manager) launchClaudeInteractive(prompt, workspace, jobName string, ext
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		return err
 	}
+	terminal, program, args, err := m.scheduledTerminalCommand(scriptPath)
+	if err != nil {
+		return err
+	}
 
 	if jobName != "" {
-		fmt.Printf("Opening scheduled Claude job in Terminal: %s\n", jobName)
+		fmt.Printf("Opening scheduled Claude job in %s: %s\n", scheduledTerminalDisplayName(terminal), jobName)
 	}
 	if workspace != "" {
 		fmt.Printf("Workspace: %s\n\n", workspace)
 	}
 
-	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", scriptPath)
+	cmd := exec.Command(program, args...)
 	cmd.Env = mergeEnv(os.Environ(), extraEnv)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -2315,12 +3218,12 @@ func (m *Manager) claudeTerminalScript(promptPath, workspace, jobName string, ex
 	return b.String()
 }
 
-func runClaudeWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]string) error {
+func runClaudeWithUI(prompt, workspace, jobName, ui string, extraEnv map[string]string, agentColor string) error {
 	switch effectiveClaudeUI(ui) {
 	case "claude":
 		return runClaudeDirect(prompt, workspace, jobName, extraEnv)
 	case "declaw":
-		return runDeclawClaudeChat(prompt, workspace, jobName, extraEnv)
+		return runDeclawClaudeChat(prompt, workspace, jobName, extraEnv, agentColor)
 	case "print":
 		return runClaudePrint(prompt, workspace, jobName, extraEnv)
 	default:
@@ -2358,13 +3261,16 @@ func (claudeDeclawChatRunner) RunTurn(sessionID, prompt, workspace string, extra
 	return runClaudePrintTurn(sessionID, prompt, workspace, extraEnv, stderrPath)
 }
 
-func runDeclawClaudeChat(prompt, workspace, jobName string, extraEnv map[string]string) error {
-	return runDeclawProviderChat(prompt, workspace, jobName, extraEnv, claudeDeclawChatRunner{})
+func runDeclawClaudeChat(prompt, workspace, jobName string, extraEnv map[string]string, agentColor string) error {
+	return runDeclawProviderChat(prompt, workspace, jobName, extraEnv, claudeDeclawChatRunner{}, agentColor)
 }
 
 func runClaudeDirect(prompt, workspace, jobName string, extraEnv map[string]string) error {
 	if strings.TrimSpace(prompt) == "" {
 		return errors.New("missing Claude prompt")
+	}
+	if err := instructions.EnsureClaudeAlias(workspace); err != nil {
+		return err
 	}
 	if _, err := exec.LookPath("claude"); err != nil {
 		return errors.New("claude command not found in PATH")
@@ -2393,6 +3299,9 @@ func runClaudePrint(prompt, workspace, jobName string, extraEnv map[string]strin
 	if strings.TrimSpace(prompt) == "" {
 		return errors.New("missing Claude prompt")
 	}
+	if err := instructions.EnsureClaudeAlias(workspace); err != nil {
+		return err
+	}
 	if _, err := exec.LookPath("claude"); err != nil {
 		return errors.New("claude command not found in PATH")
 	}
@@ -2418,6 +3327,7 @@ func runClaudePrint(prompt, workspace, jobName string, extraEnv map[string]strin
 	if err != nil {
 		return err
 	}
+	_ = markRunComplete(completionRoot(extraEnv), sanitizeName(jobName), envValue(extraEnv, "DECLAW_TRIGGER_KIND"), "Claude print", "")
 	if displayMessage != "" {
 		fmt.Println(displayMessage)
 	}
@@ -2456,7 +3366,8 @@ func startDeclawPrintTranscript(workspace, jobName, prompt string) (string, erro
 }
 
 func runClaudePrintTurn(sessionID, prompt, workspace string, extraEnv map[string]string, stderrPath string) (string, string, error) {
-	args := []string{"-p", "--dangerously-skip-permissions", "--output-format", "stream-json"}
+	args := append([]string{"-p"}, claudePermissionArgs()...)
+	args = append(args, "--output-format", "stream-json")
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
 	}
@@ -2578,18 +3489,24 @@ func extractClaudeContentText(raw json.RawMessage) string {
 }
 
 func claudeCommand(prompt string) (string, []string) {
-	return "claude", []string{"--dangerously-skip-permissions", prompt}
+	args := append([]string{}, claudePermissionArgs()...)
+	args = append(args, prompt)
+	return "claude", args
 }
 
 func claudePrintCommand(prompt string) (string, []string) {
-	return "claude", []string{"-p", "--dangerously-skip-permissions", "--output-format", "stream-json", prompt}
+	args := append([]string{"-p"}, claudePermissionArgs()...)
+	args = append(args, "--output-format", "stream-json", prompt)
+	return "claude", args
 }
 
 func claudeCommandForUI(prompt, workspace, ui string) (string, []string) {
 	_ = workspace
 	switch effectiveClaudeUI(ui) {
 	case "declaw":
-		return "claude", []string{"-p", "--dangerously-skip-permissions", "--output-format", "stream-json", prompt}
+		args := append([]string{"-p"}, claudePermissionArgs()...)
+		args = append(args, "--output-format", "stream-json", prompt)
+		return "claude", args
 	case "print":
 		return claudePrintCommand(prompt)
 	default:
@@ -2799,9 +3716,17 @@ func onceLabel(name string) string {
 	return labelPrefix + ".once." + sanitizeName(name)
 }
 
+func onceRecoveryLabel(name string) string {
+	return onceLabel(name) + ".recovery"
+}
+
 func labelsForJob(job JobRecord) []string {
 	if job.Config.Kind == "once" {
-		return []string{job.OnceLabel}
+		labels := []string{job.OnceLabel}
+		if job.HasRecovery {
+			labels = append(labels, job.OnceRecoveryLabel)
+		}
+		return labels
 	}
 	labels := []string{job.PrimaryLabel}
 	if job.HasRecovery {
@@ -2819,9 +3744,20 @@ func containsLabel(job JobRecord, label string) bool {
 	return false
 }
 
+func validateResumeJob(job JobRecord) error {
+	if job.Config.Kind != "once" {
+		return nil
+	}
+	if !time.Now().In(time.Local).Before(onceScheduledAt(job.Config)) {
+		return errors.New("cannot resume one-off job after its scheduled time; edit --at or create a new schedule")
+	}
+	return nil
+}
+
 func labelName(label string) string {
 	if strings.HasPrefix(label, labelPrefix+".once.") {
-		return strings.TrimPrefix(label, labelPrefix+".once.")
+		value := strings.TrimPrefix(label, labelPrefix+".once.")
+		return strings.TrimSuffix(value, ".recovery")
 	}
 	if strings.HasPrefix(label, labelPrefix+".recurring.") {
 		value := strings.TrimPrefix(label, labelPrefix+".recurring.")
@@ -2856,28 +3792,32 @@ func sanitizeName(value string) string {
 	return out
 }
 
-func buildCodexPrompt(prompt string, recurring bool, workspaceRoot bool) string {
+func buildCodexPrompt(prompt string, recurring bool, workspaceRoot bool, ui string) string {
 	parts := []string{scheduledCodexPromptIntro}
 	if workspaceRoot {
 		parts = append(parts, workspaceCodexPromptPrefix)
 	}
-	if workspaceRoot && recurring {
-		parts = append(parts, recurringCodexPromptPrefix)
-	}
+	_ = recurring
 	parts = append(parts, scheduledCodexLocalToolPrefix)
+	parts = append(parts, scheduledCompletionInstruction)
+	if effectiveCodexUI(ui) == "codex" {
+		parts = append(parts, rawUISessionTranscriptInstruction)
+	}
 	parts = append(parts, scheduledCodexChatHandoff)
 	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + strings.TrimSpace(prompt)
 }
 
-func buildClaudePrompt(prompt string, recurring bool, workspaceRoot bool) string {
+func buildClaudePrompt(prompt string, recurring bool, workspaceRoot bool, ui string) string {
 	parts := []string{scheduledClaudePromptIntro}
 	if workspaceRoot {
 		parts = append(parts, workspaceCodexPromptPrefix)
 	}
-	if workspaceRoot && recurring {
-		parts = append(parts, recurringCodexPromptPrefix)
-	}
+	_ = recurring
 	parts = append(parts, scheduledCodexLocalToolPrefix)
+	parts = append(parts, scheduledCompletionInstruction)
+	if effectiveClaudeUI(ui) == "claude" {
+		parts = append(parts, rawUISessionTranscriptInstruction)
+	}
 	parts = append(parts, scheduledCodexChatHandoff)
 	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + strings.TrimSpace(prompt)
 }
@@ -2888,6 +3828,106 @@ func extractTaskPrompt(prompt string) string {
 		return strings.TrimSpace(prompt[idx+len(marker):])
 	}
 	return strings.TrimSpace(prompt)
+}
+
+func onceScheduledAt(config ScheduleConfig) time.Time {
+	return time.Date(config.Year, time.Month(config.Month), config.Day, config.Hour, config.Minute, 0, 0, time.Local)
+}
+
+func onceRecoveryCalendarEntries(config ScheduleConfig) []map[string]int {
+	recoveryTime := onceScheduledAt(config).Add(30 * time.Minute)
+	return []map[string]int{{
+		"Year":   recoveryTime.Year(),
+		"Month":  int(recoveryTime.Month()),
+		"Day":    recoveryTime.Day(),
+		"Hour":   recoveryTime.Hour(),
+		"Minute": recoveryTime.Minute(),
+	}}
+}
+
+func onceSlotKey(scheduledTime string) string {
+	if strings.TrimSpace(scheduledTime) == "" {
+		return "unscheduled"
+	}
+	if parsed, err := time.Parse(time.RFC3339, scheduledTime); err == nil {
+		return parsed.In(time.Local).Format("2006-01-02-150405")
+	}
+	return sanitizeName(scheduledTime)
+}
+
+func completionRoot(extraEnv map[string]string) string {
+	if root := envValue(extraEnv, "DECLAW_RUN_ROOT"); strings.TrimSpace(root) != "" {
+		return root
+	}
+	return envValue(extraEnv, "DECLAW_RUN_DIR")
+}
+
+func completionPath(runRoot string) string {
+	if strings.TrimSpace(runRoot) == "" {
+		return ""
+	}
+	return filepath.Join(runRoot, "completion.json")
+}
+
+func readinessPath(runDir string) string {
+	if strings.TrimSpace(runDir) == "" {
+		return ""
+	}
+	return filepath.Join(runDir, "readiness.json")
+}
+
+func runReady(runDir string) bool {
+	path := readinessPath(runDir)
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func markRunReady(runDir, jobName, triggerKind string) error {
+	path := readinessPath(runDir)
+	if path == "" {
+		return errors.New("missing run directory")
+	}
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return err
+	}
+	return writeJSON(path, map[string]any{
+		"ready_at":     time.Now().In(time.Local).Format(time.RFC3339),
+		"job":          sanitizeName(jobName),
+		"trigger_kind": strings.TrimSpace(triggerKind),
+		"method":       "declaw schedule ready",
+	})
+}
+
+func runCompleted(runRoot string) bool {
+	path := completionPath(runRoot)
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func markRunComplete(runRoot, jobName, triggerKind, method, summary string) error {
+	path := completionPath(runRoot)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(runRoot, 0o755); err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"completed_at": time.Now().In(time.Local).Format(time.RFC3339),
+		"job":          sanitizeName(jobName),
+		"trigger_kind": strings.TrimSpace(triggerKind),
+		"method":       strings.TrimSpace(method),
+	}
+	if strings.TrimSpace(summary) != "" {
+		payload["summary"] = strings.TrimSpace(summary)
+	}
+	return writeJSON(path, payload)
 }
 
 func formatConfig(config ScheduleConfig) string {
@@ -2967,6 +4007,18 @@ func (m *Manager) enableLabel(label string) error {
 	return err
 }
 
+func (m *Manager) disableLabel(label string) error {
+	_, err := m.runLaunchctl(false, "disable", fmt.Sprintf("%s/%s", m.domain, label)).Output()
+	return err
+}
+
+func (m *Manager) applyInstalledLabelState(label string, paused bool) error {
+	if paused {
+		return m.disableLabel(label)
+	}
+	return m.enableLabel(label)
+}
+
 func (m *Manager) uninstallLabel(label string) error {
 	_ = m.bootout(label)
 	if err := os.Remove(m.installedPlistPath(label)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -2995,7 +4047,7 @@ func (m *Manager) removePromptFile(jobName string) {
 
 func (m *Manager) simpleLabelAction(args []string, pastTense string, action func(string) error) (string, error) {
 	if len(args) != 1 {
-		return "", errors.New("usage: declaw schedule <enable|disable|restart> <job>")
+		return "", errors.New("usage: declaw schedule <enable|disable|pause|resume|restart> <job>")
 	}
 	job, err := m.getJob(args[0])
 	if err != nil {
@@ -3007,6 +4059,38 @@ func (m *Manager) simpleLabelAction(args []string, pastTense string, action func
 			return "", err
 		}
 		lines = append(lines, fmt.Sprintf("%s %s", pastTense, label))
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func (m *Manager) setPausedState(args []string, paused bool, pastTense string) (string, error) {
+	if len(args) != 1 {
+		return "", errors.New("usage: declaw schedule <enable|disable|pause|resume> <job>")
+	}
+	store, err := m.loadJobs()
+	if err != nil {
+		return "", err
+	}
+	job, ok := store.Jobs[sanitizeName(args[0])]
+	if !ok {
+		return "", fmt.Errorf("unknown job %q", args[0])
+	}
+	if !paused {
+		if err := validateResumeJob(job); err != nil {
+			return "", err
+		}
+	}
+	lines := make([]string, 0, len(labelsForJob(job)))
+	for _, label := range labelsForJob(job) {
+		if err := m.applyInstalledLabelState(label, paused); err != nil {
+			return "", err
+		}
+		lines = append(lines, fmt.Sprintf("%s %s", pastTense, label))
+	}
+	job.Paused = paused
+	store.Jobs[job.Name] = job
+	if err := m.saveJobs(store); err != nil {
+		return "", err
 	}
 	return strings.Join(lines, "\n"), nil
 }
@@ -3067,27 +4151,30 @@ func (f *stringListFlag) Set(value string) error {
 
 func scheduleValueFlags() map[string]bool {
 	return map[string]bool{
-		"prompt":    true,
-		"provider":  true,
-		"project":   true,
-		"workspace": true,
-		"daily":     true,
-		"time":      true,
-		"weekdays":  true,
-		"weekly":    true,
-		"at":        true,
-		"year":      true,
-		"month":     true,
-		"day":       true,
-		"hour":      true,
-		"minute":    true,
-		"cwd":       true,
-		"stdout":    true,
-		"stderr":    true,
-		"weekday":   true,
-		"env":       true,
-		"type":      true,
-		"ui":        true,
+		"prompt":            true,
+		"provider":          true,
+		"harness":           true,
+		"project":           true,
+		"workspace":         true,
+		"daily":             true,
+		"time":              true,
+		"weekdays":          true,
+		"weekly":            true,
+		"at":                true,
+		"year":              true,
+		"month":             true,
+		"day":               true,
+		"hour":              true,
+		"minute":            true,
+		"cwd":               true,
+		"stdout":            true,
+		"stderr":            true,
+		"weekday":           true,
+		"env":               true,
+		"type":              true,
+		"ui":                true,
+		"agent-color":       true,
+		"clear-agent-color": false,
 	}
 }
 
@@ -3103,19 +4190,22 @@ func internalRecurringValueFlags() map[string]bool {
 		"prompt-file":    true,
 		"workspace":      true,
 		"ui":             true,
+		"agent-color":    true,
 		"weekday":        true,
 	}
 }
 
 func internalOnceValueFlags() map[string]bool {
 	return map[string]bool{
-		"job":           true,
-		"cleanup-label": true,
-		"type":          true,
-		"prompt":        true,
-		"prompt-file":   true,
-		"workspace":     true,
-		"ui":            true,
+		"job":            true,
+		"trigger-kind":   true,
+		"scheduled-time": true,
+		"type":           true,
+		"prompt":         true,
+		"prompt-file":    true,
+		"workspace":      true,
+		"ui":             true,
+		"agent-color":    true,
 	}
 }
 
@@ -3400,9 +4490,11 @@ func runtimeEnv(job, triggerKind, runDir, scheduledTime string) map[string]strin
 		"DECLAW_SCHEDULE_JOB":          sanitizeName(job),
 		"DECLAW_TRIGGER_KIND":          triggerKind,
 		"DECLAW_RUN_DIR":               runDir,
+		"DECLAW_RUN_ROOT":              runDir,
 		"AGENT_SCHEDULER_JOB":          sanitizeName(job),
 		"AGENT_SCHEDULER_TRIGGER_KIND": triggerKind,
 		"AGENT_SCHEDULER_RUN_DIR":      runDir,
+		"AGENT_SCHEDULER_RUN_ROOT":     runDir,
 	}
 	if scheduledTime != "" {
 		env["DECLAW_SCHEDULED_TIME"] = scheduledTime
@@ -3431,6 +4523,9 @@ func (m *Manager) runtimeEnvForJob(job JobRecord, triggerKind, runDir, scheduled
 	env := runtimeEnv(job.Name, triggerKind, runDir, scheduledTime)
 	if job.Type == "codex" && job.Config.Kind == "once" && !job.WorkspaceBootstrap {
 		env["DECLAW_CODEX_STATELESS"] = "1"
+	}
+	if job.AgentColor != "" {
+		env["DECLAW_AGENT_COLOR"] = job.AgentColor
 	}
 	return env
 }
@@ -3532,9 +4627,37 @@ func (m *Manager) agentLaunchCommand(jobType, prompt, workspace, jobName, ui str
 		return m.codexLaunchCommand(prompt, workspace, jobName, ui)
 	case "claude":
 		return m.claudeLaunchCommand(prompt, workspace, jobName, ui)
+	case "pi", "hermes":
+		return m.nativeLaunchCommand(jobType, prompt, workspace, jobName)
 	default:
 		return []string{jobType}
 	}
+}
+
+func (m *Manager) nativeLaunchCommand(jobType, prompt, workspace, jobName string) []string {
+	program, args, err := activity.CommandForHarness(activity.Harness(jobType), prompt)
+	if err != nil {
+		program = jobType
+		args = []string{}
+		if strings.TrimSpace(prompt) != "" {
+			args = append(args, prompt)
+		}
+	}
+	_ = workspace
+	_ = jobName
+	if len(args) > 0 && strings.TrimSpace(prompt) != "" {
+		args = append([]string(nil), args...)
+		args[len(args)-1] = "<prompt from file>"
+	}
+	return append([]string{program}, args...)
+}
+
+func isSupportedScheduleHarness(value string) bool {
+	harness, err := activity.NormalizeHarness(value)
+	if err != nil || harness == "" {
+		return false
+	}
+	return true
 }
 
 func upsertEnv(items []string, key, value string) []string {
