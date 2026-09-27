@@ -12,6 +12,7 @@ import (
 
 	"declaw/internal/activity"
 	"declaw/internal/agentworkspace"
+	"declaw/internal/conversations"
 	"declaw/internal/paths"
 	"declaw/internal/projects"
 	"declaw/internal/scheduler"
@@ -24,6 +25,12 @@ type App struct {
 	schedule       *scheduler.Manager
 	settings       *settings.Manager
 	activityDetect *activity.Detector
+
+	// cachedChats memoizes conversation discovery for the lifetime of one
+	// invocation. Scanning harness stores is the slowest thing declaw does and
+	// the launcher needs the list more than once.
+	cachedChats    []conversations.Decorated
+	cachedChatsErr error
 }
 
 func New() (*App, error) {

@@ -165,6 +165,12 @@ func selectChat(decorated []conversations.Decorated, reference string) (conversa
 const chatListLimit = 30
 
 func (a *App) allChats() ([]conversations.Decorated, error) {
+	// Building the launcher asks for conversations more than once (checkout and
+	// chat-settings), and discovery touches many files. Cache per process so
+	// the scan happens at most once per invocation.
+	if a.cachedChats != nil || a.cachedChatsErr != nil {
+		return a.cachedChats, a.cachedChatsErr
+	}
 	registry := conversations.DefaultRegistry()
 	// A failing adapter must not hide the harnesses that did load, so listing
 	// errors are tolerated here and surfaced only when nothing was found.
@@ -179,8 +185,15 @@ func (a *App) allChats() ([]conversations.Decorated, error) {
 	}
 	decorated := conversations.Decorate(list, stored)
 	if len(decorated) == 0 && listErr != nil {
+		a.cachedChatsErr = listErr
 		return nil, listErr
 	}
+	// An empty-but-successful scan is still a cacheable result; the sentinel
+	// keeps it from being rescanned on the next call.
+	if decorated == nil {
+		decorated = []conversations.Decorated{}
+	}
+	a.cachedChats = decorated
 	return decorated, nil
 }
 

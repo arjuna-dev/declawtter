@@ -2,6 +2,7 @@ package conversations
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -35,6 +36,15 @@ func (r *codexReader) Harness() activity.Harness {
 // codexSessionFileLimit bounds how many rollout files are inspected. Codex
 // keeps years of transcripts and checkout only ever shows the recent slice.
 const codexSessionFileLimit = 400
+
+// codexSummaryByteBudget caps how much of a rollout is read to build a list
+// entry. The first user turn is near the top, so a small prefix suffices.
+const codexSummaryByteBudget = 256 * 1024
+
+// codexProbeChunkBytes is the read size used when scanning a rollout for a
+// compaction marker. Raw scanning stops at the first hit, so this only bounds
+// memory, not total work.
+const codexProbeChunkBytes = 1024 * 1024
 
 func (r *codexReader) List() ([]Conversation, error) {
 	var out []Conversation
@@ -105,31 +115,74 @@ func (r *codexReader) summarize(path string) (Conversation, bool) {
 		conversation.UpdatedAt = stamp
 	}
 
-	// Scan the remainder for the first user turn (the title) and for any
-	// compaction marker. Both are cheap to detect and make the listing useful.
+	// Scan a bounded prefix for the first user turn (the title).
+	//
+	// Listing must stay fast: a heavy Codex history is gigabytes across
+	// hundreds of rollouts, and reading every line made the launcher take
+	// tens of seconds to appear. Load() still reads the whole file, so the
+	// transcript that is actually handed over remains complete; only this
+	// list preview is approximate.
+	scanned := 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if !strings.Contains(string(line), `"type"`) {
-			continue
-		}
-		var record codexRecord
-		if err := json.Unmarshal(line, &record); err != nil {
-			continue
-		}
-		switch record.Type {
-		case "compacted":
-			conversation.Compacted = true
-		case "response_item":
-			if record.Payload.Type != "message" {
-				continue
+		scanned += len(line) + 1
+		if bytes.Contains(line, []byte(`"type"`)) {
+			var record codexRecord
+			if err := json.Unmarshal(line, &record); err == nil {
+				if record.Type == "compacted" {
+					conversation.Compacted = true
+				}
+				if record.Type == "response_item" && record.Payload.Type == "message" && record.Payload.Role == "user" && conversation.Title == "" {
+					conversation.Title = TitleCandidate(codexText(record.Payload.Content))
+				}
 			}
-			conversation.MessageCount++
-			if conversation.Title == "" && record.Payload.Role == "user" {
-				conversation.Title = TitleCandidate(codexText(record.Payload.Content))
-			}
+		}
+		if conversation.Title != "" || scanned >= codexSummaryByteBudget {
+			break
 		}
 	}
+	// Compaction is recorded wherever it happened, which for a long session is
+	// the middle of a multi-megabyte file. Probing bounded windows keeps the
+	// flag accurate without reading everything; a miss only costs the list
+	// badge, since Load() reads the full file and handles compaction properly.
+	if !conversation.Compacted && codexFileHasCompaction(file) {
+		conversation.Compacted = true
+	}
 	return conversation, true
+}
+
+// codexFileHasCompaction reports whether a rollout contains a compaction
+// record. It scans raw bytes without JSON parsing and stops at the first hit,
+// which keeps it fast even across gigabytes: parsing every line was what made
+// listing slow, not reading the bytes.
+func codexFileHasCompaction(file *os.File) bool {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+	marker := []byte(`"type":"compacted"`)
+	spaced := []byte(`"type": "compacted"`)
+	buffer := make([]byte, codexProbeChunkBytes)
+	// Carry the tail of each chunk so a marker split across a chunk boundary
+	// is still matched.
+	overlap := len(spaced)
+	var carry []byte
+	for {
+		count, err := file.Read(buffer)
+		if count > 0 {
+			chunk := append(carry, buffer[:count]...)
+			if bytes.Contains(chunk, marker) || bytes.Contains(chunk, spaced) {
+				return true
+			}
+			if len(chunk) > overlap {
+				carry = append([]byte(nil), chunk[len(chunk)-overlap:]...)
+			} else {
+				carry = append([]byte(nil), chunk...)
+			}
+		}
+		if err != nil {
+			return false
+		}
+	}
 }
 
 type codexRecord struct {

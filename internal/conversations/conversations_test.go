@@ -118,6 +118,48 @@ func TestCodexReaderParsesRolloutAndDetectsCompaction(t *testing.T) {
 	}
 }
 
+// A compaction marker can sit deep inside a multi-megabyte rollout, far past
+// any cheap prefix or tail window. Listing must still flag it.
+func TestCodexDetectsCompactionDeepInLargeFile(t *testing.T) {
+	dir := t.TempDir()
+	sessions := filepath.Join(dir, "sessions", "2026", "01", "02")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rollout := filepath.Join(sessions, "rollout-2026-01-02T10-00-00-deadbeef-0000-0000-0000-000000000000.jsonl")
+
+	var builder strings.Builder
+	builder.WriteString(`{"type":"session_meta","payload":{"id":"deadbeef-0000-0000-0000-000000000000","timestamp":"2026-01-02T10:00:00Z","cwd":"` + dir + `"}}` + "\n")
+	builder.WriteString(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Ship it"}]}}` + "\n")
+	// Push the marker well beyond any prefix budget or tail probe.
+	filler := `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + strings.Repeat("y", 4000) + `"}]}}` + "\n"
+	for builder.Len() < 3*1024*1024 {
+		builder.WriteString(filler)
+	}
+	builder.WriteString(`{"type":"compacted","payload":{"message":"Condensed"}}` + "\n")
+	for i := 0; i < 200; i++ {
+		builder.WriteString(filler)
+	}
+	if err := os.WriteFile(rollout, []byte(builder.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := &codexReader{roots: []string{filepath.Join(dir, "sessions")}}
+	list, err := reader.List()
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("List() returned %d conversations, want 1", len(list))
+	}
+	if !list[0].Compacted {
+		t.Fatal("compaction marker deep in the file was not detected")
+	}
+	if list[0].Title != "Ship it" {
+		t.Fatalf("Title = %q, want %q", list[0].Title, "Ship it")
+	}
+}
+
 func TestCodexResumeCommandUsesNativeResume(t *testing.T) {
 	reader := &codexReader{}
 	program, args, err := reader.ResumeCommand(Conversation{ID: "abc", Harness: "codex"})
